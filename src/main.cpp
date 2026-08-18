@@ -1,27 +1,15 @@
 #include <Arduino.h>
-#include "config.h"
-
-unsigned long previousBlinkTime = 0;
-bool ledState = LOW;
+#include "my_lora.h"
 
 void setup()
 {
   Serial.begin(115200);
+  delay(1000);
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, ledState);
-
-  Serial.println("LED blink started");
+  initLoRa();
 }
 
 void loop()
 {
-  const unsigned long currentTime = millis();
-
-  if (currentTime - previousBlinkTime >= LED_BLINK_INTERVAL_MS)
-  {
-    previousBlinkTime = currentTime;
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState);
-  }
+  handleLoRa();
 }
