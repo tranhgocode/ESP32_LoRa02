@@ -1,27 +1,73 @@
-# ESP32 + LoRa-02
+# ESP32 LoRa-02 Gateway
 
-Chuong trinh thu gui/nhan LoRa bang thu vien `sandeepmistry/LoRa@^0.8.0` va PlatformIO.
+This project uses an ESP32 and a LoRa-02 module to send or receive LoRa packets. In receiver mode, valid temperature and humidity data is forwarded to ThingsBoard over MQTT.
 
-## Ket noi
+## Hardware
 
-| LoRa-02 | ESP32 | Chuc nang |
-| --- | --- | --- |
-| 3.3V | 3V3 | Nguon 3.3 V |
-| GND | GND | Mass |
-| SCK | GPIO18 | SPI clock |
-| MISO | GPIO19 | LoRa -> ESP32 |
-| MOSI | GPIO23 | ESP32 -> LoRa |
-| NSS / CS | GPIO27 | SPI chip select |
-| RESET | GPIO14 | Reset LoRa |
-| DIO0 | GPIO26 | Ngat RxDone / TxDone |
+- ESP32 development board
+- LoRa-02 433 MHz module
+- 433 MHz antenna
 
-> Chi cap LoRa-02 bang **3.3 V**, khong dung 5 V. Nen gan anten phu hop truoc khi phat.
+## Wiring
 
-## Chay thu
+| LoRa-02 pin | ESP32 pin | Purpose |
+|---|---:|---|
+| VCC | 3.3V | Power |
+| GND | GND | Ground |
+| SCK | GPIO 18 | SPI clock |
+| MISO | GPIO 19 | SPI data from LoRa |
+| MOSI | GPIO 23 | SPI data to LoRa |
+| NSS / CS | GPIO 27 | SPI chip select |
+| RESET | GPIO 14 | Module reset |
+| DIO0 | GPIO 26 | Interrupt signal |
 
-1. Trong `include/config.h`, dat `LORA_MODE_TX` la `1` cho bo phat, hoac `0` cho bo nhan.
-2. Cam ESP32, sau do chay **PlatformIO: Upload**.
-3. Mo **PlatformIO: Serial Monitor** o toc do `115200` baud.
-4. Bo phat gui mot goi moi 2 giay; bo nhan hien noi dung, RSSI va SNR.
+> Important: Power the LoRa-02 module with **3.3 V only** and connect the antenna before transmitting.
 
-De thu truyen thuc te, can hai bo ESP32 + LoRa-02: nap mot bo o che do phat va mot bo o che do nhan. Ca hai phai co cung tan so; mac dinh trong `include/config.h` la `433E6` (433 MHz).
+## Configuration
+
+Copy `.env.example` to `.env`, then enter your Wi-Fi and ThingsBoard settings:
+
+```env
+WIFI_SSID=YOUR_WIFI_SSID
+WIFI_PASSWORD=YOUR_WIFI_PASSWORD
+MQTT_HOST=YOUR_MQTT_HOST
+MQTT_PORT=1883
+THINGSBOARD_ACCESS_TOKEN=YOUR_ACCESS_TOKEN
+MQTT_TELEMETRY_TOPIC=v1/devices/me/telemetry
+```
+
+Do not commit `.env` because it contains private credentials.
+
+Select the LoRa mode in `include/config.h`:
+
+```cpp
+#define LORA_MODE_TX 0  // 0: receiver, 1: transmitter
+```
+
+Both devices must use the same frequency, sync word, spreading factor, bandwidth, and coding rate.
+
+## Telemetry Format
+
+The receiver accepts messages such as:
+
+```text
+T:25.5,H:60.2
+```
+
+Valid data is published to ThingsBoard as:
+
+```json
+{"temperature":25.50,"humidity":60.20}
+```
+
+## Build and Upload
+
+Open the project with PlatformIO, then run:
+
+```bash
+pio run
+pio run --target upload
+pio device monitor
+```
+
+The Serial Monitor baud rate is `115200`.
