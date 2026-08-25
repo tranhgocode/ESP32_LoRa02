@@ -61,8 +61,9 @@ void initMqtt()
   esp_mqtt_client_config_t mqttConfig = {};
   mqttConfig.host = MQTT_HOST;
   mqttConfig.port = MQTT_PORT;
-  mqttConfig.username = THINGSBOARD_ACCESS_TOKEN;
-  mqttConfig.password = nullptr;
+  mqttConfig.client_id = MQTT_CLIENT_ID;
+  mqttConfig.username = MQTT_USERNAME;
+  mqttConfig.password = MQTT_PASSWORD;
   mqttConfig.event_handle = handleMqttEvent;
   mqttConfig.keepalive = 60;
   mqttConfig.reconnect_timeout_ms = 5000;
@@ -108,7 +109,7 @@ bool sendTelemetry(float temperature, float humidity)
   const int payloadLength = snprintf(
       payload,
       sizeof(payload),
-      "{\"temperature\":%.2f,\"humidity\":%.2f}",
+      "{\"T\":%.2f,\"H\":%.2f}",
       temperature,
       humidity);
 

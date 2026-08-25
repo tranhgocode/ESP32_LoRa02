@@ -10,16 +10,16 @@ This project uses an ESP32 and a LoRa-02 module to send or receive LoRa packets.
 
 ## Wiring
 
-| LoRa-02 pin | ESP32 pin | Purpose |
-|---|---:|---|
-| VCC | 3.3V | Power |
-| GND | GND | Ground |
-| SCK | GPIO 18 | SPI clock |
-| MISO | GPIO 19 | SPI data from LoRa |
-| MOSI | GPIO 23 | SPI data to LoRa |
-| NSS / CS | GPIO 27 | SPI chip select |
-| RESET | GPIO 14 | Module reset |
-| DIO0 | GPIO 26 | Interrupt signal |
+| LoRa-02 pin | ESP32 pin | Purpose            |
+| ----------- | --------: | ------------------ |
+| VCC         |      3.3V | Power              |
+| GND         |       GND | Ground             |
+| SCK         |   GPIO 18 | SPI clock          |
+| MISO        |   GPIO 19 | SPI data from LoRa |
+| MOSI        |   GPIO 23 | SPI data to LoRa   |
+| NSS / CS    |   GPIO 27 | SPI chip select    |
+| RESET       |   GPIO 14 | Module reset       |
+| DIO0        |   GPIO 26 | Interrupt signal   |
 
 > Important: Power the LoRa-02 module with **3.3 V only** and connect the antenna before transmitting.
 
@@ -32,7 +32,9 @@ WIFI_SSID=YOUR_WIFI_SSID
 WIFI_PASSWORD=YOUR_WIFI_PASSWORD
 MQTT_HOST=YOUR_MQTT_HOST
 MQTT_PORT=1883
-THINGSBOARD_ACCESS_TOKEN=YOUR_ACCESS_TOKEN
+MQTT_CLIENT_ID=YOUR_MQTT_CLIENT_ID
+MQTT_USERNAME=YOUR_MQTT_USERNAME
+MQTT_PASSWORD=YOUR_MQTT_PASSWORD
 MQTT_TELEMETRY_TOPIC=v1/devices/me/telemetry
 ```
 
@@ -57,7 +59,7 @@ T:25.5,H:60.2
 Valid data is published to ThingsBoard as:
 
 ```json
-{"temperature":25.50,"humidity":60.20}
+{ "temperature": 25.5, "humidity": 60.2 }
 ```
 
 ## Build and Upload

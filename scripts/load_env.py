@@ -12,7 +12,9 @@ REQUIRED_KEYS = (
     "WIFI_PASSWORD",
     "MQTT_HOST",
     "MQTT_PORT",
-    "THINGSBOARD_ACCESS_TOKEN",
+    "MQTT_CLIENT_ID",
+    "MQTT_USERNAME",
+    "MQTT_PASSWORD",
     "MQTT_TELEMETRY_TOPIC",
 )
 
@@ -78,7 +80,9 @@ header_lines = [
     f"#define WIFI_PASSWORD {json.dumps(config['WIFI_PASSWORD'])}",
     f"#define MQTT_HOST {json.dumps(config['MQTT_HOST'])}",
     f"#define MQTT_PORT {mqtt_port}",
-    f"#define THINGSBOARD_ACCESS_TOKEN {json.dumps(config['THINGSBOARD_ACCESS_TOKEN'])}",
+    f"#define MQTT_CLIENT_ID {json.dumps(config['MQTT_CLIENT_ID'])}",
+    f"#define MQTT_USERNAME {json.dumps(config['MQTT_USERNAME'])}",
+    f"#define MQTT_PASSWORD {json.dumps(config['MQTT_PASSWORD'])}",
     f"#define MQTT_TELEMETRY_TOPIC {json.dumps(config['MQTT_TELEMETRY_TOPIC'])}",
     "",
 ]
