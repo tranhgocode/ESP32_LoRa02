@@ -1,0 +1,3 @@
+[submodule "submodules/SAMD21_LoRa02"]
+	path = submodules/SAMD21_LoRa02
+	url = https://github.com/tranhgocode/SAMD21_LoRa02.git
