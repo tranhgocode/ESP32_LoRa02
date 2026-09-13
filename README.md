@@ -1,6 +1,6 @@
 # ESP32 LoRa-02 Gateway
 
-This project uses an ESP32 and a LoRa-02 module to send or receive LoRa packets. In receiver mode, valid temperature and humidity data is forwarded to ThingsBoard over MQTT.
+This project uses an ESP32 and a LoRa-02 module as a gateway. The default transition build receives legacy text telemetry and forwards valid temperature and humidity data to ThingsBoard over MQTT. A binary protocol V1 radio adapter is available behind a build flag for the polling gateway work in progress.
 
 ## Hardware
 
@@ -40,17 +40,21 @@ MQTT_TELEMETRY_TOPIC=v1/devices/me/telemetry
 
 Do not commit `.env` because it contains private credentials.
 
-Select the LoRa mode in `include/config.h`:
+Radio pins and physical-layer parameters are defined in `include/app_config.h`.
+The binary gateway path is disabled by default until its coordinator integration
+is completed. Override the flag at build time without editing source:
 
-```cpp
-#define LORA_MODE_TX 0  // 0: receiver, 1: transmitter
+```powershell
+$env:PLATFORMIO_BUILD_FLAGS = "-DGATEWAY_V1_ENABLED=1"
+pio run -e esp32dev
+Remove-Item Env:PLATFORMIO_BUILD_FLAGS
 ```
 
 Both devices must use the same frequency, sync word, spreading factor, bandwidth, and coding rate.
 
 ## Telemetry Format
 
-The receiver accepts messages such as:
+With `GATEWAY_V1_ENABLED=0`, the compatibility receiver accepts messages such as:
 
 ```text
 T:25.5,H:60.2
