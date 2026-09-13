@@ -4,7 +4,12 @@
 #include "app_config.h"
 #include "send_mqtt.h"
 
-#if !GATEWAY_V1_ENABLED
+#if GATEWAY_V1_ENABLED
+#include "gateway_packet.h"
+#include "poll_coordinator.h"
+#include "sensor_registry.h"
+#include "telemetry_buffer.h"
+#else
 #include <ctype.h>
 #include <math.h>
 #include <stdlib.h>
@@ -15,41 +20,260 @@ namespace
 {
 #if GATEWAY_V1_ENABLED
 /**
- * Report radio events during the T07 binary-adapter slice.
- *
- * T08 will replace the V1 FrameReceived diagnostic with the coordinator and
- * queue flow. Keeping this handler byte-oriented ensures the enabled V1 build
- * cannot call the previous text parser or MQTT publisher accidentally.
+ * Identify which coordinator action owns the adapter's one asynchronous TX.
+ * The application clears this value before reporting completion so a resulting
+ * coordinator transition can start its next transmission immediately.
  */
-void handleV1RadioEvent(const gateway::adapter::LoRaRadioEvent &event)
+enum class PendingRadioTransmission : uint8_t
 {
-    switch (event.type)
+    None = 0U,
+    Poll,
+    Ack
+};
+
+gateway::SensorRegistry sensorRegistry{};
+gateway::PollCoordinator pollCoordinator{};
+gateway::TelemetryBuffer telemetryBuffer{};
+PendingRadioTransmission pendingRadioTransmission =
+    PendingRadioTransmission::None;
+bool gatewayV1Ready = false;
+
+static_assert(gateway::MAX_FRAME_LENGTH <=
+                  gateway::adapter::LORA_RADIO_FRAME_CAPACITY,
+              "Radio adapter cannot carry a maximum-size V1 frame");
+
+void processCoordinatorEvent(const gateway::CoordinatorEvent &event);
+
+/** Add an accepted DATA sample to the bounded queue exactly once. */
+void enqueueCoordinatorSample(const gateway::TelemetrySample &sample)
+{
+    const uint32_t droppedBefore = telemetryBuffer.telemetryDropped;
+    if (!gateway::pushTelemetrySample(&telemetryBuffer, &sample))
     {
-    case gateway::adapter::LoRaRadioEventType::FrameReceived:
-        Serial.print("Data: Received binary LoRa frame, bytes: ");
-        Serial.print(event.frameLength);
-        Serial.print(" | RSSI: ");
-        Serial.print(event.rssi);
-        Serial.print(" dBm | SNR: ");
-        Serial.println(static_cast<float>(event.snrX4) / 4.0F);
-        break;
-
-    case gateway::adapter::LoRaRadioEventType::FrameDropped:
-        Serial.print("Warning: Dropped oversized or incomplete LoRa frame, reported bytes: ");
-        Serial.println(event.frameLength);
-        break;
-
-    case gateway::adapter::LoRaRadioEventType::TransmitSucceeded:
-        Serial.println("Status: LoRa transmission completed");
-        break;
-
-    case gateway::adapter::LoRaRadioEventType::TransmitFailed:
-        Serial.println("Error: LoRa transmission timed out; receive mode restored");
-        break;
-
-    default:
-        break;
+        Serial.println("Error: Failed to append V1 sample to RAM queue");
+        return;
     }
+
+    if (telemetryBuffer.telemetryDropped != droppedBefore)
+    {
+        Serial.println("Warning: RAM queue full; oldest V1 sample was dropped");
+    }
+
+    Serial.print("Data: V1 sample queued, node: ");
+    Serial.print(sample.nodeId);
+    Serial.print(" | sequence: ");
+    Serial.print(sample.sequence);
+    Serial.print(" | queue size: ");
+    Serial.println(gateway::telemetryBufferSize(&telemetryBuffer));
+}
+
+/** Convert an action kind into the TX completion event expected by the core. */
+gateway::CoordinatorEventType transmitResultEventType(
+    PendingRadioTransmission transmission,
+    bool succeeded)
+{
+    if (transmission == PendingRadioTransmission::Poll)
+    {
+        return succeeded
+                   ? gateway::CoordinatorEventType::PollTxSucceeded
+                   : gateway::CoordinatorEventType::PollTxFailed;
+    }
+
+    return succeeded
+               ? gateway::CoordinatorEventType::AckTxSucceeded
+               : gateway::CoordinatorEventType::AckTxFailed;
+}
+
+/** Tell the coordinator that a requested packet could not start transmission. */
+void reportTransmitStartFailure(PendingRadioTransmission transmission,
+                                uint32_t nowMs)
+{
+    gateway::CoordinatorEvent event{};
+    event.type = transmitResultEventType(transmission, false);
+    event.nowMs = nowMs;
+    processCoordinatorEvent(event);
+}
+
+/**
+ * Encode and start one POLL or ACK without blocking for radio completion.
+ * Immediate codec/driver failures are converted back into coordinator events,
+ * keeping transaction state consistent when no later adapter event will exist.
+ */
+void startCoordinatorTransmission(const gateway::CoordinatorAction &action,
+                                  uint32_t nowMs)
+{
+    const PendingRadioTransmission requestedTransmission =
+        action.type == gateway::CoordinatorActionType::SendPoll
+            ? PendingRadioTransmission::Poll
+            : PendingRadioTransmission::Ack;
+
+    uint8_t frame[gateway::MAX_FRAME_LENGTH] = {};
+    size_t frameLength = 0U;
+    if (!gateway::encodePacket(
+            &action.packet, frame, sizeof(frame), &frameLength))
+    {
+        Serial.println("Error: Coordinator produced an invalid V1 packet");
+        reportTransmitStartFailure(requestedTransmission, nowMs);
+        return;
+    }
+
+    const gateway::adapter::LoRaTransmitStartResult result =
+        gateway::adapter::startLoRaTransmit(frame, frameLength);
+    if (result != gateway::adapter::LoRaTransmitStartResult::Started)
+    {
+        Serial.print("Error: Could not start V1 transmission: ");
+        Serial.println(gateway::adapter::loRaTransmitStartResultName(result));
+        reportTransmitStartFailure(requestedTransmission, nowMs);
+        return;
+    }
+
+    pendingRadioTransmission = requestedTransmission;
+    Serial.print(requestedTransmission == PendingRadioTransmission::Poll
+                     ? "Status: V1 POLL started, node: "
+                     : "Status: V1 ACK started, node: ");
+    Serial.print(action.packet.destination);
+    Serial.print(" | transaction: ");
+    Serial.print(action.packet.transactionId);
+    Serial.print(" | sequence: ");
+    Serial.println(action.packet.sequence);
+}
+
+/** Execute the bounded side effects returned by one pure state transition. */
+void dispatchCoordinatorAction(const gateway::CoordinatorAction &action,
+                               uint32_t nowMs)
+{
+    if (action.hasSample)
+    {
+        enqueueCoordinatorSample(action.sample);
+    }
+
+    if (action.type == gateway::CoordinatorActionType::SendPoll ||
+        action.type == gateway::CoordinatorActionType::SendAck)
+    {
+        startCoordinatorTransmission(action, nowMs);
+    }
+}
+
+/**
+ * Pass exactly one event through GatewayCore and execute the returned action.
+ * Capturing the active node before a timeout transition preserves useful logs
+ * after the coordinator clears its transaction fields.
+ */
+void processCoordinatorEvent(const gateway::CoordinatorEvent &event)
+{
+    const gateway::CoordinatorPhase previousPhase = pollCoordinator.phase;
+    const uint8_t previousNode = pollCoordinator.activeNodeAddress;
+    const gateway::CoordinatorAction action = gateway::handleCoordinatorEvent(
+        &pollCoordinator, &sensorRegistry, &event);
+
+    if (event.type == gateway::CoordinatorEventType::Tick &&
+        previousPhase == gateway::CoordinatorPhase::WaitingForResponse &&
+        pollCoordinator.phase == gateway::CoordinatorPhase::Idle)
+    {
+        Serial.print("Warning: V1 response timeout, node: ");
+        Serial.println(previousNode);
+    }
+
+    dispatchCoordinatorAction(action, event.nowMs);
+}
+
+/**
+ * Map one adapter event to the radio-independent coordinator vocabulary.
+ * Dropped frames remain diagnostics only, while RX metadata travels with a
+ * complete frame so an accepted sample retains RSSI and quarter-dB SNR.
+ */
+void handleV1RadioEvent(const gateway::adapter::LoRaRadioEvent &radioEvent,
+                        uint32_t nowMs)
+{
+    if (radioEvent.type == gateway::adapter::LoRaRadioEventType::FrameDropped)
+    {
+        Serial.print("Warning: Dropped oversized or incomplete LoRa frame, reported bytes: ");
+        Serial.println(radioEvent.frameLength);
+        return;
+    }
+
+    gateway::CoordinatorEvent event{};
+    event.nowMs = nowMs;
+
+    if (radioEvent.type == gateway::adapter::LoRaRadioEventType::FrameReceived)
+    {
+        event.type = gateway::CoordinatorEventType::FrameReceived;
+        event.frame = radioEvent.frame;
+        event.frameLength = radioEvent.frameLength;
+        event.rssi = radioEvent.rssi;
+        event.snrX4 = radioEvent.snrX4;
+        processCoordinatorEvent(event);
+        return;
+    }
+
+    const bool isTransmitResult =
+        radioEvent.type ==
+            gateway::adapter::LoRaRadioEventType::TransmitSucceeded ||
+        radioEvent.type == gateway::adapter::LoRaRadioEventType::TransmitFailed;
+    if (!isTransmitResult)
+    {
+        return;
+    }
+
+    if (pendingRadioTransmission == PendingRadioTransmission::None)
+    {
+        Serial.println("Warning: Ignored LoRa TX result without an owning V1 action");
+        return;
+    }
+
+    const PendingRadioTransmission completedTransmission =
+        pendingRadioTransmission;
+    pendingRadioTransmission = PendingRadioTransmission::None;
+    const bool succeeded =
+        radioEvent.type ==
+        gateway::adapter::LoRaRadioEventType::TransmitSucceeded;
+    event.type = transmitResultEventType(completedTransmission, succeeded);
+
+    if (!succeeded)
+    {
+        Serial.println("Error: LoRa transmission timed out; receive mode restored");
+    }
+
+    processCoordinatorEvent(event);
+}
+
+/** Validate static node configuration and reset all V1 runtime owners. */
+bool initializeGatewayV1(uint32_t nowMs)
+{
+    const gateway::RegistryInitResult registryResult =
+        gateway::initializeSensorRegistry(
+            &sensorRegistry,
+            gateway_config::SENSOR_NODES,
+            gateway_config::SENSOR_NODE_COUNT,
+            nowMs);
+    if (registryResult != gateway::RegistryInitResult::Ok)
+    {
+        Serial.print("Error: V1 sensor registry initialization failed: ");
+        Serial.println(gateway::registryInitResultName(registryResult));
+        return false;
+    }
+
+    gateway::initializePollCoordinator(&pollCoordinator);
+    gateway::resetTelemetryBuffer(&telemetryBuffer);
+    pendingRadioTransmission = PendingRadioTransmission::None;
+
+    Serial.print("Status: V1 sensor registry ready, configured nodes: ");
+    Serial.println(sensorRegistry.count);
+    return true;
+}
+
+/** Supply a clock tick only after both the registry and radio are ready. */
+void serviceGatewayV1Tick()
+{
+    if (!gatewayV1Ready)
+    {
+        return;
+    }
+
+    gateway::CoordinatorEvent event{};
+    event.type = gateway::CoordinatorEventType::Tick;
+    event.nowMs = millis();
+    processCoordinatorEvent(event);
 }
 #else
 /**
@@ -166,7 +390,7 @@ void handleLegacyRadioEvent(const gateway::adapter::LoRaRadioEvent &event)
 }
 #endif
 
-/** Poll the adapter once so loop remains responsive to Wi-Fi and MQTT work. */
+/** Poll the adapter once and process at most one event without waiting. */
 void serviceRadio()
 {
     gateway::adapter::LoRaRadioEvent event{};
@@ -176,7 +400,10 @@ void serviceRadio()
     }
 
 #if GATEWAY_V1_ENABLED
-    handleV1RadioEvent(event);
+    if (gatewayV1Ready)
+    {
+        handleV1RadioEvent(event, millis());
+    }
 #else
     handleLegacyRadioEvent(event);
 #endif
@@ -189,9 +416,16 @@ void setup()
     Serial.begin(115200);
     delay(1000);
 
-    // MQTT connection maintenance remains independent from the radio service.
-    // The V1 path will begin producing queued telemetry in T08.
+    // MQTT startup requests Wi-Fi/client connection asynchronously. The V1
+    // queue is intentionally not drained into MQTT until the later MQTT task.
     initMqtt();
+
+#if GATEWAY_V1_ENABLED
+    if (!initializeGatewayV1(millis()))
+    {
+        return;
+    }
+#endif
 
     Serial.print("Status: Starting LoRa at ");
     Serial.print(LORA_FREQUENCY / 1000000L);
@@ -208,7 +442,8 @@ void setup()
 
     Serial.println("Status: LoRa is ready in receive mode");
 #if GATEWAY_V1_ENABLED
-    Serial.println("Mode: Gateway protocol V1 binary adapter");
+    gatewayV1Ready = true;
+    Serial.println("Mode: Gateway protocol V1, one node to RAM queue");
 #else
     Serial.println("Mode: Legacy text telemetry compatibility");
 #endif
@@ -216,8 +451,14 @@ void setup()
 
 void loop()
 {
-    // Both services perform bounded work and return without waiting for network
-    // or radio activity, keeping the loop ready for the T08 coordinator tick.
-    handleMqtt();
+    // Service radio first so TX completion and received DATA reach the
+    // coordinator with minimum loop-induced delay.
     serviceRadio();
+#if GATEWAY_V1_ENABLED
+    serviceGatewayV1Tick();
+#endif
+
+    // Wi-Fi retry is time-gated and MQTT runs asynchronously. In V1 mode this
+    // call never reads or removes samples from the RAM queue.
+    handleMqtt();
 }

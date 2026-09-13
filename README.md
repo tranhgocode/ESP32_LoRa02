@@ -1,6 +1,6 @@
 # ESP32 LoRa-02 Gateway
 
-This project uses an ESP32 and a LoRa-02 module as a gateway. The default transition build receives legacy text telemetry and forwards valid temperature and humidity data to ThingsBoard over MQTT. A binary protocol V1 radio adapter is available behind a build flag for the polling gateway work in progress.
+This project uses an ESP32 and a LoRa-02 module as a gateway. The default transition build receives legacy text telemetry and forwards valid temperature and humidity data to ThingsBoard over MQTT. When the protocol V1 build flag is enabled, the gateway polls one statically configured sensor, acknowledges valid binary responses, and stores accepted DATA samples in a bounded RAM queue.
 
 ## Hardware
 
@@ -41,8 +41,12 @@ MQTT_TELEMETRY_TOPIC=v1/devices/me/telemetry
 Do not commit `.env` because it contains private credentials.
 
 Radio pins and physical-layer parameters are defined in `include/app_config.h`.
-The binary gateway path is disabled by default until its coordinator integration
-is completed. Override the flag at build time without editing source:
+The sensor list is defined in `src/app_config.cpp`; T08 enables address `0x01`
+with a 10-second polling interval. The registry accepts at most five unique
+addresses, and every interval must be at least 1500 ms.
+
+The binary gateway path remains disabled by default until radio timing is
+verified on hardware. Override the flag at build time without editing source:
 
 ```powershell
 $env:PLATFORMIO_BUILD_FLAGS = "-DGATEWAY_V1_ENABLED=1"
@@ -65,6 +69,14 @@ Valid data is published to ThingsBoard as:
 ```json
 { "temperature": 25.5, "humidity": 60.2 }
 ```
+
+With `GATEWAY_V1_ENABLED=1`, the gateway sends binary POLL packets and handles
+DATA or ERROR responses. Every valid response matching the active transaction
+receives an ACK. A new, in-range DATA sample retains its node address, sequence,
+fixed-point measurements, RSSI, SNR, and receive time in a 64-entry RAM queue.
+ERROR responses are acknowledged without creating a sample. MQTT delivery from
+this V1 queue is planned for a later task, so queued samples are currently lost
+when the gateway resets.
 
 ## Build and Upload
 
