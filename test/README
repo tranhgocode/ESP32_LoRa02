@@ -1,11 +1,33 @@
+# Gateway tests
 
-This directory is intended for PlatformIO Test Runner and project tests.
+Each `test_<module>` directory is an independent PlatformIO test application.
+Pure code under `lib/GatewayCore` runs in the `native` environment without
+Arduino, LoRa, Wi-Fi, MQTT credentials, or physical hardware.
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
+Run all native suites from the repository root:
 
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+```powershell
+pio test -e native
+```
+
+Run one suite while developing a module:
+
+```powershell
+pio test -e native -f test_gateway_packet
+```
+
+The native environment intentionally leaves `test_build_src` disabled. Tests
+include the required `GatewayCore` header and PlatformIO's Library Dependency
+Finder compiles that private library. Hardware adapters in `src/` therefore do
+not enter the host build.
+
+Firmware and hardware verification remain separate:
+
+```powershell
+pio run -e esp32dev
+pio run -e esp32dev --target upload
+pio device monitor --baud 115200
+```
+
+Native tests prove portable business logic. Upload and serial checks are still
+required for LoRa timing, Wi-Fi, MQTT, RSSI, and SNR behavior.
