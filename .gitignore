@@ -28,10 +28,12 @@ compile_commands.json
 *.log
 *.tmp
 *.swp
+*.swo
 *~
 
 # Operating-system metadata
 .DS_Store
 Thumbs.db
+Desktop.ini
 orkspace
 test/
