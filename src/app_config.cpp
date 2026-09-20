@@ -22,6 +22,7 @@ namespace gateway_config
 // follows the project contract and remains above the DHT11 cooldown minimum.
 const gateway::SensorNodeConfig SENSOR_NODES[] = {
     makeSensorNode(0x01U, 10000U, true),
+    makeSensorNode(0x02U, 10000U, true),
 };
 
 // Derive the count from the array so adding or removing a configuration cannot

@@ -28,20 +28,45 @@ bool deadlineReached(uint32_t nowMs, uint32_t deadlineMs)
     return static_cast<int32_t>(nowMs - deadlineMs) >= 0;
 }
 
-/** Find the first enabled due node; T06 exercises this with one configured node. */
-size_t findDueNodeIndex(const SensorRegistry &registry, uint32_t nowMs)
+/**
+ * Select the enabled node that has waited longest past its deadline.
+ *
+ * Scanning from nextPollIndex makes equal deadlines round-robin without
+ * weakening the oldest-deadline priority. Due elapsed times are in the normal
+ * half-range timer window, so unsigned subtraction also works across wrap.
+ */
+size_t findDueNodeIndex(const PollCoordinator &coordinator,
+                        const SensorRegistry &registry,
+                        uint32_t nowMs)
 {
     const size_t count = safeRegistryCount(registry);
-    for (size_t index = 0U; index < count; ++index)
+    if (count == 0U)
     {
+        return MAX_SENSOR_NODES;
+    }
+
+    const size_t startIndex = coordinator.nextPollIndex % count;
+    size_t selectedIndex = MAX_SENSOR_NODES;
+    uint32_t longestOverdueMs = 0U;
+
+    for (size_t offset = 0U; offset < count; ++offset)
+    {
+        const size_t index = (startIndex + offset) % count;
         if (registry.configs[index].enabled &&
             deadlineReached(nowMs, registry.states[index].nextPollAtMs))
         {
-            return index;
+            const uint32_t overdueMs =
+                nowMs - registry.states[index].nextPollAtMs;
+            if (selectedIndex == MAX_SENSOR_NODES ||
+                overdueMs > longestOverdueMs)
+            {
+                selectedIndex = index;
+                longestOverdueMs = overdueMs;
+            }
         }
     }
 
-    return MAX_SENSOR_NODES;
+    return selectedIndex;
 }
 
 /** Locate the state/config slot bound to the transaction's node address. */
@@ -118,6 +143,8 @@ CoordinatorAction beginPoll(PollCoordinator &coordinator,
     coordinator.transactionId = coordinator.nextTransactionId;
     coordinator.nextTransactionId =
         static_cast<uint8_t>(coordinator.nextTransactionId + 1U);
+    const size_t count = safeRegistryCount(registry);
+    coordinator.nextPollIndex = static_cast<uint8_t>((nodeIndex + 1U) % count);
     return action;
 }
 
@@ -353,7 +380,8 @@ CoordinatorAction handleCoordinatorEvent(PollCoordinator *coordinator,
     case CoordinatorPhase::Idle:
         if (event->type == CoordinatorEventType::Tick)
         {
-            const size_t nodeIndex = findDueNodeIndex(*registry, event->nowMs);
+            const size_t nodeIndex =
+                findDueNodeIndex(*coordinator, *registry, event->nowMs);
             if (nodeIndex < MAX_SENSOR_NODES)
             {
                 return beginPoll(*coordinator, *registry, nodeIndex);

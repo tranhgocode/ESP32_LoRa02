@@ -56,7 +56,7 @@ void enqueueCoordinatorSample(const gateway::TelemetrySample &sample)
 
     if (telemetryBuffer.telemetryDropped != droppedBefore)
     {
-        Serial.println("Warning: RAM queue full; oldest V1 sample was dropped");
+        Serial.println("Warning: RAM queue full, oldest V1 sample was dropped");
     }
 
     Serial.print("Data: V1 sample queued, node: ");
@@ -231,7 +231,7 @@ void handleV1RadioEvent(const gateway::adapter::LoRaRadioEvent &radioEvent,
 
     if (!succeeded)
     {
-        Serial.println("Error: LoRa transmission timed out; receive mode restored");
+        Serial.println("Error: LoRa transmission timed out, receive mode restored");
     }
 
     processCoordinatorEvent(event);

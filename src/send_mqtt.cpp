@@ -22,7 +22,7 @@ namespace
       break;
 
     case MQTT_EVENT_DISCONNECTED:
-      Serial.println("Warning: MQTT disconnected; waiting to reconnect...");
+      Serial.println("Warning: MQTT disconnected, waiting to reconnect...");
       break;
 
     case MQTT_EVENT_PUBLISHED:
