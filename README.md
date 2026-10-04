@@ -41,12 +41,11 @@ MQTT_TELEMETRY_TOPIC=v1/devices/me/telemetry
 Do not commit `.env` because it contains private credentials.
 
 Radio pins and physical-layer parameters are defined in `include/app_config.h`.
-The sensor list is defined in `src/app_config.cpp`; T08 enables address `0x01`
-with a 10-second polling interval. The registry accepts at most five unique
-addresses, and every interval must be at least 1500 ms.
+The sensor list is defined in `src/app_config.cpp`; addresses `0x01` and `0x02`
+are enabled with 10-second polling intervals. The registry accepts at most five
+unique addresses, and every interval must be at least 1500 ms.
 
-The binary gateway path remains disabled by default until radio timing is
-verified on hardware. Override the flag at build time without editing source:
+The binary gateway path can be selected at build time without editing source:
 
 ```powershell
 $env:PLATFORMIO_BUILD_FLAGS = "-DGATEWAY_V1_ENABLED=1"
@@ -67,16 +66,29 @@ T:25.5,H:60.2
 Valid data is published to ThingsBoard as:
 
 ```json
-{ "temperature": 25.5, "humidity": 60.2 }
+{ "T": 25.50, "H": 60.20 }
 ```
 
 With `GATEWAY_V1_ENABLED=1`, the gateway sends binary POLL packets and handles
 DATA or ERROR responses. Every valid response matching the active transaction
 receives an ACK. A new, in-range DATA sample retains its node address, sequence,
 fixed-point measurements, RSSI, SNR, and receive time in a 64-entry RAM queue.
-ERROR responses are acknowledged without creating a sample. MQTT delivery from
-this V1 queue is planned for a later task, so queued samples are currently lost
-when the gateway resets.
+ERROR responses are acknowledged without creating a sample. The loop serializes
+at most one queued sample per iteration and hands it to the asynchronous MQTT
+QoS 1 outbox. FIFO entries are removed only after that handoff succeeds; a
+rejected handoff remains at the head and is retried after one second. The
+gateway sends MQTT work only between LoRa transactions, so an ESP-IDF MQTT
+outbox lock wait cannot interrupt an active POLL/response/ACK exchange. The
+installed ESP-IDF 4.4.7 MQTT client has no hard outbox size setting; the adapter
+limits estimated QoS 1 packet bytes to 8 KiB, including topic and MQTT headers.
+That is a software ceiling on packet bytes, not a measured heap ceiling. The SDK
+protects enqueue and outbox-size calls with an internal mutex, and its network
+timeout is set to 100 ms; multiple operations can occur under one lock, so this
+does not guarantee a strict bound on total call time. Enqueue and PUBACK totals
+are logged as a periodic aggregate. Device timing and actual broker receipt
+still need hardware verification. An accepted enqueue is not a broker PUBACK,
+and the RAM queue/outbox are lost on gateway reset. The SDK source used for the
+mutex review is [ESP-MQTT v4.4.7](https://github.com/espressif/esp-mqtt/blob/bb9c8af9d552b608dd3aabf9617bde757a538ebe/mqtt_client.c).
 
 ## Build and Upload
 
