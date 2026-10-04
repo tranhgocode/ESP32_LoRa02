@@ -2,15 +2,33 @@
 
 #include <stdint.h>
 
-// Keep the binary path disabled by default until its timing is verified on a
-// real LoRa-02 pair. PlatformIO can override this macro with
-// -DGATEWAY_V1_ENABLED=1 for development and hardware acceptance.
+// Preserve the existing POLL default; uplink UART is an explicit opt-in.
 #ifndef GATEWAY_V1_ENABLED
 #define GATEWAY_V1_ENABLED 1
 #endif
 
 #if GATEWAY_V1_ENABLED != 0 && GATEWAY_V1_ENABLED != 1
 #error "GATEWAY_V1_ENABLED must be 0 or 1"
+#endif
+
+#ifndef GATEWAY_UPLINK_ENABLED
+#define GATEWAY_UPLINK_ENABLED 0
+#endif
+#ifndef GATEWAY_UPLINK_MQTT_ENABLED
+#define GATEWAY_UPLINK_MQTT_ENABLED 0
+#endif
+#if (GATEWAY_UPLINK_ENABLED != 0 && GATEWAY_UPLINK_ENABLED != 1) || \
+    (GATEWAY_UPLINK_MQTT_ENABLED != 0 && GATEWAY_UPLINK_MQTT_ENABLED != 1)
+#error "Gateway uplink flags must be 0 or 1"
+#endif
+#if GATEWAY_UPLINK_ENABLED && !GATEWAY_V1_ENABLED
+#error "Gateway uplink requires GATEWAY_V1_ENABLED=1"
+#endif
+#if GATEWAY_UPLINK_MQTT_ENABLED && !GATEWAY_UPLINK_ENABLED
+#error "Gateway uplink MQTT requires GATEWAY_UPLINK_ENABLED=1"
+#endif
+#if GATEWAY_UPLINK_MQTT_ENABLED
+#error "UPLINK_MQTT is not implemented yet; use UPLINK_UART for radio acceptance"
 #endif
 
 // ESP32 pins connected to the LoRa-02 module. These values preserve the wiring

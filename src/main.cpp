@@ -6,10 +6,15 @@
 
 #if GATEWAY_V1_ENABLED
 #include "gateway_packet.h"
+#if GATEWAY_UPLINK_ENABLED
+#include "uplink_coordinator.h"
+#include <stdio.h>
+#else
 #include "poll_coordinator.h"
-#include "sensor_registry.h"
 #include "telemetry_buffer.h"
 #include "telemetry_delivery.h"
+#endif
+#include "sensor_registry.h"
 #else
 #include <ctype.h>
 #include <math.h>
@@ -20,6 +25,121 @@
 namespace
 {
 #if GATEWAY_V1_ENABLED
+#if GATEWAY_UPLINK_ENABLED
+gateway::SensorRegistry sensorRegistry{};
+gateway::UplinkCoordinator uplinkCoordinator{};
+bool gatewayV1Ready = false;
+bool uplinkAckPending = false;
+
+static_assert(gateway::MAX_FRAME_LENGTH <=
+                  gateway::adapter::LORA_RADIO_FRAME_CAPACITY,
+              "Radio adapter cannot carry a maximum-size V1 frame");
+
+/** One bounded UART write, admitted only when the entire line fits now.
+ * A short/failed write rejects recording, so it never authorizes an ACK.
+ * UART acceptance confirms gateway processing, not durable storage.
+ */
+bool recordUplinkReport(const gateway::UplinkAction &report)
+{
+    char line[128] = {};
+    int length = 0;
+    if (report.hasSample)
+    {
+        length = snprintf(line, sizeof(line),
+                          "DATA Src=%u Dest=%u ID=%u Seq=%u RSSI=%d SNRx4=%d temperature_x10=%d humidity_x10=%u\n",
+                          report.packet.source, report.packet.destination,
+                          report.packet.transactionId, report.packet.sequence,
+                          report.rssi, report.snrX4,
+                          report.sample.temperatureX10, report.sample.humidityX10);
+    }
+    else
+    {
+        length = snprintf(line, sizeof(line),
+                          "ERROR Src=%u Dest=%u ID=%u Seq=%u RSSI=%d SNRx4=%d error_code=%u\n",
+                          report.packet.source, report.packet.destination,
+                          report.packet.transactionId, report.packet.sequence,
+                          report.rssi, report.snrX4,
+                          static_cast<uint8_t>(report.errorCode));
+    }
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line) ||
+        Serial.availableForWrite() < length)
+    {
+        return false;
+    }
+    return Serial.write(reinterpret_cast<const uint8_t *>(line), length) ==
+           static_cast<size_t>(length);
+}
+
+void processUplinkEvent(const gateway::UplinkEvent &event)
+{
+    gateway::UplinkAction action = gateway::handleUplinkEvent(
+        &uplinkCoordinator, &sensorRegistry, &event);
+    if (action.type == gateway::UplinkActionType::RecordReport)
+    {
+        gateway::UplinkEvent confirmation{};
+        confirmation.type = recordUplinkReport(action)
+                                ? gateway::UplinkEventType::ReportAccepted
+                                : gateway::UplinkEventType::ReportRejected;
+        action = gateway::handleUplinkEvent(
+            &uplinkCoordinator, &sensorRegistry, &confirmation);
+    }
+    if (action.type != gateway::UplinkActionType::SendAck)
+    {
+        return;
+    }
+    uint8_t frame[gateway::MAX_FRAME_LENGTH] = {};
+    size_t length = 0U;
+    if (gateway::encodePacket(&action.packet, frame, sizeof(frame), &length) &&
+        gateway::adapter::startLoRaTransmit(frame, length) ==
+            gateway::adapter::LoRaTransmitStartResult::Started)
+    {
+        uplinkAckPending = true;
+        return;
+    }
+    gateway::UplinkEvent failure{};
+    failure.type = gateway::UplinkEventType::AckTxFailed;
+    gateway::handleUplinkEvent(&uplinkCoordinator, &sensorRegistry, &failure);
+}
+
+void handleV1RadioEvent(const gateway::adapter::LoRaRadioEvent &radioEvent,
+                        uint32_t nowMs)
+{
+    gateway::UplinkEvent event{};
+    if (radioEvent.type == gateway::adapter::LoRaRadioEventType::FrameReceived)
+    {
+        event.frame = radioEvent.frame;
+        event.frameLength = radioEvent.frameLength;
+        event.nowMs = nowMs;
+        event.rssi = radioEvent.rssi;
+        event.snrX4 = radioEvent.snrX4;
+    }
+    else if (uplinkAckPending &&
+             (radioEvent.type == gateway::adapter::LoRaRadioEventType::TransmitSucceeded ||
+              radioEvent.type == gateway::adapter::LoRaRadioEventType::TransmitFailed))
+    {
+        uplinkAckPending = false;
+        event.type = radioEvent.type == gateway::adapter::LoRaRadioEventType::TransmitSucceeded
+                         ? gateway::UplinkEventType::AckTxSucceeded
+                         : gateway::UplinkEventType::AckTxFailed;
+    }
+    else
+    {
+        return;
+    }
+    processUplinkEvent(event);
+}
+
+bool initializeGatewayV1(uint32_t nowMs)
+{
+    gatewayV1Ready = false;
+    uplinkAckPending = false;
+    gateway::initializeUplinkCoordinator(&uplinkCoordinator);
+    return gateway::initializeSensorRegistry(
+               &sensorRegistry, gateway_config::SENSOR_NODES,
+               gateway_config::SENSOR_NODE_COUNT, nowMs) ==
+           gateway::RegistryInitResult::Ok;
+}
+#else
 /**
  * Identify which coordinator action owns the adapter's one asynchronous TX.
  * The application clears this value before reporting completion so a resulting
@@ -316,6 +436,7 @@ void serviceGatewayV1Telemetry()
         Serial.println("Error: Invalid V1 telemetry delivery state");
     }
 }
+#endif // GATEWAY_UPLINK_ENABLED
 #else
 /**
  * Convert the old text telemetry into a bounded uppercase representation.
@@ -458,7 +579,9 @@ void setup()
     delay(1000);
 
     // MQTT startup requests Wi-Fi/client connection asynchronously.
+#if !GATEWAY_UPLINK_ENABLED
     initMqtt();
+#endif
 
 #if GATEWAY_V1_ENABLED
     if (!initializeGatewayV1(millis()))
@@ -483,7 +606,11 @@ void setup()
     Serial.println("Status: LoRa is ready in receive mode");
 #if GATEWAY_V1_ENABLED
     gatewayV1Ready = true;
+#if GATEWAY_UPLINK_ENABLED
+    Serial.println("Mode: UPLINK_UART, node 0x01, record then ACK");
+#else
     Serial.println("Mode: Gateway protocol V1, telemetry queued to MQTT");
+#endif
 #else
     Serial.println("Mode: Legacy text telemetry compatibility");
 #endif
@@ -496,10 +623,12 @@ void loop()
     serviceRadio();
 
     // Wi-Fi retry and MQTT network I/O are asynchronous.
+#if !GATEWAY_UPLINK_ENABLED
     handleMqtt();
 #if GATEWAY_V1_ENABLED
     serviceGatewayV1Telemetry();
     // Start new LoRa work after the idle-only MQTT outbox handoff.
     serviceGatewayV1Tick();
+#endif
 #endif
 }
