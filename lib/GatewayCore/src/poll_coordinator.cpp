@@ -9,6 +9,11 @@ namespace
 constexpr int16_t MIN_TEMPERATURE_X10 = -400;
 constexpr int16_t MAX_TEMPERATURE_X10 = 800;
 constexpr uint16_t MAX_HUMIDITY_X10 = 1000U;
+constexpr size_t RESPONSE_HEADER_LENGTH = 4U;
+constexpr size_t TYPE_OFFSET = 0U;
+constexpr size_t SOURCE_OFFSET = 1U;
+constexpr size_t DESTINATION_OFFSET = 2U;
+constexpr size_t TRANSACTION_ID_OFFSET = 3U;
 
 /** Clamp traversal if a damaged registry advertises more physical slots. */
 size_t safeRegistryCount(const SensorRegistry &registry)
@@ -28,20 +33,45 @@ bool deadlineReached(uint32_t nowMs, uint32_t deadlineMs)
     return static_cast<int32_t>(nowMs - deadlineMs) >= 0;
 }
 
-/** Find the first enabled due node; T06 exercises this with one configured node. */
-size_t findDueNodeIndex(const SensorRegistry &registry, uint32_t nowMs)
+/**
+ * Select the enabled node that has waited longest past its deadline.
+ *
+ * Scanning from nextPollIndex makes equal deadlines round-robin without
+ * weakening the oldest-deadline priority. Due elapsed times are in the normal
+ * half-range timer window, so unsigned subtraction also works across wrap.
+ */
+size_t findDueNodeIndex(const PollCoordinator &coordinator,
+                        const SensorRegistry &registry,
+                        uint32_t nowMs)
 {
     const size_t count = safeRegistryCount(registry);
-    for (size_t index = 0U; index < count; ++index)
+    if (count == 0U)
     {
+        return MAX_SENSOR_NODES;
+    }
+
+    const size_t startIndex = coordinator.nextPollIndex % count;
+    size_t selectedIndex = MAX_SENSOR_NODES;
+    uint32_t longestOverdueMs = 0U;
+
+    for (size_t offset = 0U; offset < count; ++offset)
+    {
+        const size_t index = (startIndex + offset) % count;
         if (registry.configs[index].enabled &&
             deadlineReached(nowMs, registry.states[index].nextPollAtMs))
         {
-            return index;
+            const uint32_t overdueMs =
+                nowMs - registry.states[index].nextPollAtMs;
+            if (selectedIndex == MAX_SENSOR_NODES ||
+                overdueMs > longestOverdueMs)
+            {
+                selectedIndex = index;
+                longestOverdueMs = overdueMs;
+            }
         }
     }
 
-    return MAX_SENSOR_NODES;
+    return selectedIndex;
 }
 
 /** Locate the state/config slot bound to the transaction's node address. */
@@ -89,6 +119,17 @@ void scheduleNextPoll(SensorRegistry &registry,
         nowMs + registry.configs[nodeIndex].pollIntervalMs;
 }
 
+/** Apply the bounded offline backoff after the failure counter is updated. */
+void scheduleNextPollAfterTimeout(SensorRegistry &registry,
+                                  size_t nodeIndex,
+                                  uint32_t nowMs)
+{
+    registry.states[nodeIndex].nextPollAtMs =
+        nowMs + timeoutPollDelayMs(registry.configs[nodeIndex],
+                                   registry.states[nodeIndex]
+                                       .consecutiveFailures);
+}
+
 /** Clear fields that must not authorize a frame after a transaction closes. */
 void closeTransaction(PollCoordinator &coordinator)
 {
@@ -118,6 +159,8 @@ CoordinatorAction beginPoll(PollCoordinator &coordinator,
     coordinator.transactionId = coordinator.nextTransactionId;
     coordinator.nextTransactionId =
         static_cast<uint8_t>(coordinator.nextTransactionId + 1U);
+    const size_t count = safeRegistryCount(registry);
+    coordinator.nextPollIndex = static_cast<uint8_t>((nodeIndex + 1U) % count);
     return action;
 }
 
@@ -174,6 +217,46 @@ bool matchesActiveTransaction(const PollCoordinator &coordinator,
            message.transactionId == coordinator.transactionId;
 }
 
+/**
+ * Attribute a rejected frame only when its complete routing header identifies
+ * the active DATA/ERROR transaction. Short frames and frames naming any other
+ * source remain unattributed because their origin is not sufficiently clear.
+ */
+bool hasActiveResponseHeader(const PollCoordinator &coordinator,
+                             const CoordinatorEvent &event)
+{
+    if (event.frame == nullptr ||
+        event.frameLength < RESPONSE_HEADER_LENGTH)
+    {
+        return false;
+    }
+
+    const uint8_t type = event.frame[TYPE_OFFSET];
+    return (type == static_cast<uint8_t>(PacketType::Data) ||
+            type == static_cast<uint8_t>(PacketType::Error)) &&
+           event.frame[SOURCE_OFFSET] == coordinator.activeNodeAddress &&
+           event.frame[DESTINATION_OFFSET] == GATEWAY_ADDRESS &&
+           event.frame[TRANSACTION_ID_OFFSET] == coordinator.transactionId;
+}
+
+/** Count one malformed frame without treating it as link-health evidence. */
+void recordMalformedActiveResponse(const PollCoordinator &coordinator,
+                                   SensorRegistry &registry,
+                                   const CoordinatorEvent &event)
+{
+    if (!hasActiveResponseHeader(coordinator, event))
+    {
+        return;
+    }
+
+    const size_t nodeIndex =
+        findNodeIndex(registry, coordinator.activeNodeAddress);
+    if (nodeIndex < MAX_SENSOR_NODES)
+    {
+        incrementSaturating(registry.states[nodeIndex].packetErrorCount);
+    }
+}
+
 /** Update measurements that prove the configured node was heard at this time. */
 void updateLinkState(SensorNodeState &state, const CoordinatorEvent &event)
 {
@@ -199,7 +282,7 @@ void recordResponseTimeout(PollCoordinator &coordinator,
         SensorNodeState &state = registry.states[nodeIndex];
         incrementSaturating(state.timeoutCount);
         incrementSaturating(state.consecutiveFailures);
-        scheduleNextPoll(registry, nodeIndex, nowMs);
+        scheduleNextPollAfterTimeout(registry, nodeIndex, nowMs);
     }
 
     closeTransaction(coordinator);
@@ -297,8 +380,13 @@ CoordinatorAction handleAckPendingFrame(PollCoordinator &coordinator,
                                         const CoordinatorEvent &event)
 {
     PacketMessage message{};
-    if (!decodeReceivedFrame(event, message) ||
-        !responsesEqual(message, coordinator.acceptedResponse))
+    if (!decodeReceivedFrame(event, message))
+    {
+        recordMalformedActiveResponse(coordinator, registry, event);
+        return CoordinatorAction{};
+    }
+
+    if (!responsesEqual(message, coordinator.acceptedResponse))
     {
         return CoordinatorAction{};
     }
@@ -353,7 +441,8 @@ CoordinatorAction handleCoordinatorEvent(PollCoordinator *coordinator,
     case CoordinatorPhase::Idle:
         if (event->type == CoordinatorEventType::Tick)
         {
-            const size_t nodeIndex = findDueNodeIndex(*registry, event->nowMs);
+            const size_t nodeIndex =
+                findDueNodeIndex(*coordinator, *registry, event->nowMs);
             if (nodeIndex < MAX_SENSOR_NODES)
             {
                 return beginPoll(*coordinator, *registry, nodeIndex);
@@ -383,11 +472,18 @@ CoordinatorAction handleCoordinatorEvent(PollCoordinator *coordinator,
         if (event->type == CoordinatorEventType::FrameReceived)
         {
             PacketMessage message{};
-            if (decodeReceivedFrame(*event, message) &&
-                matchesActiveTransaction(*coordinator, message))
+            if (decodeReceivedFrame(*event, message))
             {
-                return acceptResponse(
-                    *coordinator, *registry, *event, message);
+                if (matchesActiveTransaction(*coordinator, message))
+                {
+                    return acceptResponse(
+                        *coordinator, *registry, *event, message);
+                }
+            }
+            else
+            {
+                recordMalformedActiveResponse(
+                    *coordinator, *registry, *event);
             }
         }
         break;

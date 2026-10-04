@@ -1,14 +1,15 @@
 #include <Arduino.h>
 
 #include "adapters/lora_radio.h"
+#include "adapters/mqtt_transport.h"
 #include "app_config.h"
-#include "send_mqtt.h"
 
 #if GATEWAY_V1_ENABLED
 #include "gateway_packet.h"
 #include "poll_coordinator.h"
 #include "sensor_registry.h"
 #include "telemetry_buffer.h"
+#include "telemetry_delivery.h"
 #else
 #include <ctype.h>
 #include <math.h>
@@ -34,6 +35,7 @@ enum class PendingRadioTransmission : uint8_t
 gateway::SensorRegistry sensorRegistry{};
 gateway::PollCoordinator pollCoordinator{};
 gateway::TelemetryBuffer telemetryBuffer{};
+gateway::TelemetryDeliveryService telemetryDeliveryService{};
 PendingRadioTransmission pendingRadioTransmission =
     PendingRadioTransmission::None;
 bool gatewayV1Ready = false;
@@ -56,7 +58,7 @@ void enqueueCoordinatorSample(const gateway::TelemetrySample &sample)
 
     if (telemetryBuffer.telemetryDropped != droppedBefore)
     {
-        Serial.println("Warning: RAM queue full; oldest V1 sample was dropped");
+        Serial.println("Warning: RAM queue full, oldest V1 sample was dropped");
     }
 
     Serial.print("Data: V1 sample queued, node: ");
@@ -231,7 +233,7 @@ void handleV1RadioEvent(const gateway::adapter::LoRaRadioEvent &radioEvent,
 
     if (!succeeded)
     {
-        Serial.println("Error: LoRa transmission timed out; receive mode restored");
+        Serial.println("Error: LoRa transmission timed out, receive mode restored");
     }
 
     processCoordinatorEvent(event);
@@ -255,6 +257,7 @@ bool initializeGatewayV1(uint32_t nowMs)
 
     gateway::initializePollCoordinator(&pollCoordinator);
     gateway::resetTelemetryBuffer(&telemetryBuffer);
+    telemetryDeliveryService = gateway::TelemetryDeliveryService{};
     pendingRadioTransmission = PendingRadioTransmission::None;
 
     Serial.print("Status: V1 sensor registry ready, configured nodes: ");
@@ -274,6 +277,44 @@ void serviceGatewayV1Tick()
     event.type = gateway::CoordinatorEventType::Tick;
     event.nowMs = millis();
     processCoordinatorEvent(event);
+}
+
+/** Copy one queued V1 JSON document into the asynchronous MQTT outbox. */
+bool publishV1Telemetry(const char *payload,
+                        size_t payloadLength,
+                        void *)
+{
+    return sendTelemetryPayload(payload, payloadLength);
+}
+
+/** Hand off at most one FIFO sample so MQTT work cannot starve the radio. */
+void serviceGatewayV1Telemetry()
+{
+    // ESP-IDF 4.4.7 protects enqueue/outbox calls with MQTT_API_LOCK, which can
+    // wait on network work. Only enter MQTT while no POLL/ACK transaction or
+    // radio transmission is active; serviceRadio() has already run this loop.
+    if (pendingRadioTransmission != PendingRadioTransmission::None ||
+        pollCoordinator.phase != gateway::CoordinatorPhase::Idle)
+    {
+        return;
+    }
+
+    const gateway::TelemetryDeliveryResult result =
+        gateway::serviceTelemetryDelivery(
+            &telemetryBuffer,
+            publishV1Telemetry,
+            nullptr,
+            &telemetryDeliveryService,
+            millis());
+
+    if (result == gateway::TelemetryDeliveryResult::EncodingFailed)
+    {
+        Serial.println("Error: Failed to serialize queued V1 telemetry");
+    }
+    else if (result == gateway::TelemetryDeliveryResult::InvalidArgument)
+    {
+        Serial.println("Error: Invalid V1 telemetry delivery state");
+    }
 }
 #else
 /**
@@ -416,8 +457,7 @@ void setup()
     Serial.begin(115200);
     delay(1000);
 
-    // MQTT startup requests Wi-Fi/client connection asynchronously. The V1
-    // queue is intentionally not drained into MQTT until the later MQTT task.
+    // MQTT startup requests Wi-Fi/client connection asynchronously.
     initMqtt();
 
 #if GATEWAY_V1_ENABLED
@@ -443,7 +483,7 @@ void setup()
     Serial.println("Status: LoRa is ready in receive mode");
 #if GATEWAY_V1_ENABLED
     gatewayV1Ready = true;
-    Serial.println("Mode: Gateway protocol V1, one node to RAM queue");
+    Serial.println("Mode: Gateway protocol V1, telemetry queued to MQTT");
 #else
     Serial.println("Mode: Legacy text telemetry compatibility");
 #endif
@@ -454,11 +494,12 @@ void loop()
     // Service radio first so TX completion and received DATA reach the
     // coordinator with minimum loop-induced delay.
     serviceRadio();
+
+    // Wi-Fi retry and MQTT network I/O are asynchronous.
+    handleMqtt();
 #if GATEWAY_V1_ENABLED
+    serviceGatewayV1Telemetry();
+    // Start new LoRa work after the idle-only MQTT outbox handoff.
     serviceGatewayV1Tick();
 #endif
-
-    // Wi-Fi retry is time-gated and MQTT runs asynchronously. In V1 mode this
-    // call never reads or removes samples from the RAM queue.
-    handleMqtt();
 }

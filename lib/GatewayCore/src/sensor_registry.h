@@ -4,6 +4,10 @@
 
 namespace gateway
 {
+// Once a seen node is offline, failed attempts are never spaced farther apart
+// than one minute so recovery is still detected in bounded time.
+constexpr uint32_t MAX_OFFLINE_POLL_INTERVAL_MS = 60000U;
+
 /**
  * Validate a complete build-time node list and initialize its runtime state.
  *
@@ -43,6 +47,17 @@ const SensorNodeState *findNodeState(const SensorRegistry *registry,
  * Degraded, and 3 or more is Offline.
  */
 NodeHealth deriveNodeHealth(const SensorNodeState &state);
+
+/**
+ * Return the delay after a response timeout.
+ *
+ * The first two consecutive timeouts retain the configured poll interval. From
+ * the third timeout onward the interval doubles for each additional failure,
+ * capped at one minute. The calculation clamps before multiplication so even a
+ * corrupted or extreme interval cannot overflow uint32_t.
+ */
+uint32_t timeoutPollDelayMs(const SensorNodeConfig &config,
+                            uint8_t consecutiveFailures);
 
 /** Return a stable, allocation-free diagnostic label for initialization logs. */
 const char *registryInitResultName(RegistryInitResult result);

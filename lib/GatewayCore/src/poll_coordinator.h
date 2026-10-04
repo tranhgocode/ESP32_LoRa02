@@ -91,6 +91,8 @@ struct CoordinatorAction
  * a byte-equivalent sensor retry can receive the same ACK without producing a
  * second sample or incrementing a counter twice. nextTransactionId advances
  * whenever a POLL action is emitted and naturally wraps from 255 to 0.
+ * nextPollIndex starts the next due-node scan after the most recently polled
+ * registry slot, providing a stable round-robin tie break.
  */
 struct PollCoordinator
 {
@@ -98,6 +100,7 @@ struct PollCoordinator
     uint8_t activeNodeAddress = GATEWAY_ADDRESS;
     uint8_t transactionId = 0U;
     uint8_t nextTransactionId = 0U;
+    uint8_t nextPollIndex = 0U;
     uint32_t responseStartedAtMs = 0U;
     PacketMessage acceptedResponse{};
 };

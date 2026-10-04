@@ -169,6 +169,32 @@ NodeHealth deriveNodeHealth(const SensorNodeState &state)
     return NodeHealth::Offline;
 }
 
+uint32_t timeoutPollDelayMs(const SensorNodeConfig &config,
+                            uint8_t consecutiveFailures)
+{
+    if (consecutiveFailures < 3U)
+    {
+        return config.pollIntervalMs;
+    }
+
+    uint32_t delayMs = config.pollIntervalMs;
+    uint8_t doublings = static_cast<uint8_t>(consecutiveFailures - 2U);
+    while (doublings > 0U)
+    {
+        // Returning the cap before multiplying prevents both arithmetic
+        // overflow and unnecessary work for a saturated failure counter.
+        if (delayMs >= MAX_OFFLINE_POLL_INTERVAL_MS / 2U)
+        {
+            return MAX_OFFLINE_POLL_INTERVAL_MS;
+        }
+
+        delayMs *= 2U;
+        --doublings;
+    }
+
+    return delayMs;
+}
+
 const char *registryInitResultName(RegistryInitResult result)
 {
     switch (result)

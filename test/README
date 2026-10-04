@@ -16,6 +16,14 @@ Run one suite while developing a module:
 pio test -e native -f test_gateway_packet
 ```
 
+The MQTT delivery suite also checks retry timing across `millis()` wrap,
+drop-oldest overflow/recovery, and that the real coordinator continues to
+accept and ACK DATA while a fake publisher repeatedly rejects queue delivery:
+
+```powershell
+pio test -e native -f test_telemetry_delivery
+```
+
 The native environment intentionally leaves `test_build_src` disabled. Tests
 include the required `GatewayCore` header and PlatformIO's Library Dependency
 Finder compiles that private library. Hardware adapters in `src/` therefore do
@@ -31,3 +39,11 @@ pio device monitor --baud 115200
 
 Native tests prove portable business logic. Upload and serial checks are still
 required for LoRa timing, Wi-Fi, MQTT, RSSI, and SNR behavior.
+
+For MQTT hardware acceptance, observe the periodic `enqueued` and `QoS 1 PUBACK`
+totals separately. Check a disconnected broker/client and a broker that stops
+acknowledging while a node is polled; confirm that LoRa exchanges continue and
+the queue retries without exceeding the 8 KiB packet-byte soft cap. Reconnect
+the broker and confirm the queue drains FIFO. Record actual ACK timing and
+broker payloads; native fake-publisher tests do not prove SDK mutex latency,
+heap use, or broker delivery.
