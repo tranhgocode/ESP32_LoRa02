@@ -1,36 +1,5 @@
 #pragma once
-
 #include <stdint.h>
-
-// Preserve the existing POLL default; uplink UART is an explicit opt-in.
-#ifndef GATEWAY_V1_ENABLED
-#define GATEWAY_V1_ENABLED 1
-#endif
-
-#if GATEWAY_V1_ENABLED != 0 && GATEWAY_V1_ENABLED != 1
-#error "GATEWAY_V1_ENABLED must be 0 or 1"
-#endif
-
-#ifndef GATEWAY_UPLINK_ENABLED
-#define GATEWAY_UPLINK_ENABLED 0
-#endif
-#ifndef GATEWAY_UPLINK_MQTT_ENABLED
-#define GATEWAY_UPLINK_MQTT_ENABLED 0
-#endif
-#if (GATEWAY_UPLINK_ENABLED != 0 && GATEWAY_UPLINK_ENABLED != 1) || \
-    (GATEWAY_UPLINK_MQTT_ENABLED != 0 && GATEWAY_UPLINK_MQTT_ENABLED != 1)
-#error "Gateway uplink flags must be 0 or 1"
-#endif
-#if GATEWAY_UPLINK_ENABLED && !GATEWAY_V1_ENABLED
-#error "Gateway uplink requires GATEWAY_V1_ENABLED=1"
-#endif
-#if GATEWAY_UPLINK_MQTT_ENABLED && !GATEWAY_UPLINK_ENABLED
-#error "Gateway uplink MQTT requires GATEWAY_UPLINK_ENABLED=1"
-#endif
-#if GATEWAY_UPLINK_MQTT_ENABLED
-#error "UPLINK_MQTT is not implemented yet; use UPLINK_UART for radio acceptance"
-#endif
-
 // ESP32 pins connected to the LoRa-02 module. These values preserve the wiring
 // used by the original gateway implementation.
 constexpr uint8_t LORA_SCK = 18U;
@@ -53,20 +22,12 @@ constexpr int LORA_CODING_RATE_DENOMINATOR = 5;
 // a missed DIO0 interrupt cannot leave the application stuck indefinitely.
 constexpr uint32_t LORA_TX_TIMEOUT_MS = 1000U;
 
-#if GATEWAY_V1_ENABLED
 #include "gateway_model.h"
 
 #include <stddef.h>
 
 namespace gateway_config
 {
-/**
- * Build-time sensor list consumed by the V1 registry during setup.
- *
- * T08 starts with one enabled node. Later tasks may add entries here up to
- * gateway::MAX_SENSOR_NODES without changing the radio or coordinator APIs.
- */
 extern const gateway::SensorNodeConfig SENSOR_NODES[];
 extern const size_t SENSOR_NODE_COUNT;
 } // namespace gateway_config
-#endif

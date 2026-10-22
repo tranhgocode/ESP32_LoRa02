@@ -1,6 +1,5 @@
 #include "app_config.h"
 
-#if GATEWAY_V1_ENABLED && GATEWAY_UPLINK_ENABLED
 #include "uart_reporter.h"
 #include <Arduino.h>
 #include <stdio.h>
@@ -45,4 +44,3 @@ bool recordUplinkReport(const gateway::UplinkAction &report)
 }
 } // namespace adapter
 } // namespace gateway
-#endif

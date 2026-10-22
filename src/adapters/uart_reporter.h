@@ -2,7 +2,6 @@
 
 #include "app_config.h"
 
-#if GATEWAY_V1_ENABLED && GATEWAY_UPLINK_ENABLED
 #include "uplink_coordinator.h"
 
 namespace gateway
@@ -13,4 +12,3 @@ namespace adapter
 bool recordUplinkReport(const UplinkAction &report);
 } // namespace adapter
 } // namespace gateway
-#endif
