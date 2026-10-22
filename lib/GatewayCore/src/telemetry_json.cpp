@@ -83,4 +83,33 @@ bool serializeTelemetryJson(const TelemetrySample *sample,
     *outputLength = payloadLength;
     return true;
 }
+bool serializeGatewayTelemetryJson(const TelemetrySample *sample, const SensorRegistry *registry,
+    char *output, size_t capacity, size_t *length)
+{
+    if (sample == nullptr || output == nullptr || length == nullptr) return false;
+    const SensorNodeConfig *config = findNodeConfig(registry, sample->nodeId);
+    if (config == nullptr || !config->enabled || !isValidDeviceName(config->deviceName)) return false;
+    char values[TELEMETRY_JSON_CAPACITY] = {};
+    size_t valuesLength = 0U;
+    if (!serializeTelemetryJson(sample, values, sizeof(values), &valuesLength)) return false;
+    char candidate[TELEMETRY_JSON_CAPACITY] = {};
+    int written = snprintf(candidate, sizeof(candidate), "{\"%s\":[%s]}", config->deviceName, values);
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(candidate) ||
+        static_cast<size_t>(written) >= capacity) return false;
+    memcpy(output, candidate, static_cast<size_t>(written) + 1U);
+    *length = static_cast<size_t>(written);
+    return true;
+}
+bool serializeGatewayConnectJson(const SensorNodeConfig *config, char *output, size_t capacity, size_t *length)
+{
+    if (config == nullptr || output == nullptr || length == nullptr ||
+        !config->enabled || !isValidDeviceName(config->deviceName)) return false;
+    char candidate[DEVICE_NAME_CAPACITY + 16U] = {};
+    int written = snprintf(candidate, sizeof(candidate), "{\"device\":\"%s\"}", config->deviceName);
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(candidate) ||
+        static_cast<size_t>(written) >= capacity) return false;
+    memcpy(output, candidate, static_cast<size_t>(written) + 1U);
+    *length = static_cast<size_t>(written);
+    return true;
+}
 } // namespace gateway
