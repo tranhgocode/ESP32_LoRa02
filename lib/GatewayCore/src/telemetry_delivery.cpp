@@ -6,10 +6,11 @@ namespace gateway
 {
 TelemetryDeliveryResult deliverNextTelemetry(
     TelemetryBuffer *buffer,
+    const SensorRegistry *registry,
     TelemetryPublishFunction publish,
     void *publishContext)
 {
-    if (buffer == nullptr || publish == nullptr)
+    if (buffer == nullptr || registry == nullptr || publish == nullptr)
     {
         return TelemetryDeliveryResult::InvalidArgument;
     }
@@ -22,8 +23,8 @@ TelemetryDeliveryResult deliverNextTelemetry(
 
     char payload[TELEMETRY_JSON_CAPACITY] = {};
     size_t payloadLength = 0U;
-    if (!serializeTelemetryJson(
-            sample, payload, sizeof(payload), &payloadLength))
+    if (!serializeGatewayTelemetryJson(
+            sample, registry, payload, sizeof(payload), &payloadLength))
     {
         return TelemetryDeliveryResult::EncodingFailed;
     }
@@ -43,6 +44,7 @@ TelemetryDeliveryResult deliverNextTelemetry(
 
 TelemetryDeliveryResult serviceTelemetryDelivery(
     TelemetryBuffer *buffer,
+    const SensorRegistry *registry,
     TelemetryPublishFunction publish,
     void *publishContext,
     TelemetryDeliveryService *service,
@@ -60,7 +62,7 @@ TelemetryDeliveryResult serviceTelemetryDelivery(
     }
 
     const TelemetryDeliveryResult result = deliverNextTelemetry(
-        buffer, publish, publishContext);
+        buffer, registry, publish, publishContext);
     if (result == TelemetryDeliveryResult::PublishRejected ||
         result == TelemetryDeliveryResult::EncodingFailed)
     {
