@@ -1,4 +1,5 @@
 #include "mqtt_transport.h"
+#include "mqtt_ack_queue.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -21,6 +22,11 @@ constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000UL;
 constexpr unsigned long MQTT_STATUS_LOG_INTERVAL_MS = 10000UL;
 
 esp_mqtt_client_handle_t mqttClient = nullptr;
+// MQTT callback is the sole producer; loop is the sole consumer. If the
+// bounded ACK ring overflows we re-register, never infer a missing PUBACK.
+gateway::adapter::MqttAckQueue ackQueue;
+std::atomic<uint32_t> connectionGeneration{0U};
+gateway::adapter::RegistrationAckTracker registrationAck;
 std::atomic<bool> mqttConnected{false};
 std::atomic<uint32_t> mqttAcceptedCount{0U};
 std::atomic<uint32_t> mqttPublishedCount{0U};
@@ -39,6 +45,7 @@ esp_err_t handleMqttEvent(esp_mqtt_event_handle_t event)
 
   if (event->event_id == MQTT_EVENT_CONNECTED)
   {
+    ++connectionGeneration;
     if (!mqttConnected.exchange(true, std::memory_order_acq_rel))
     {
       Serial.println("Status: MQTT connected to ThingsBoard");
@@ -53,6 +60,7 @@ esp_err_t handleMqttEvent(esp_mqtt_event_handle_t event)
   }
   else if (event->event_id == MQTT_EVENT_PUBLISHED)
   {
+    ackQueue.push(connectionGeneration.load(std::memory_order_acquire), event->msg_id);
     mqttPublishedCount.fetch_add(1U, std::memory_order_relaxed);
   }
 
@@ -163,26 +171,25 @@ void handleMqtt()
   }
 }
 
-bool sendTelemetry(float temperature, float humidity)
+gateway::MqttSession mqttSession()
 {
-  char payload[96] = {};
-  const int payloadLength = snprintf(
-      payload,
-      sizeof(payload),
-      "{\"T\":%.2f,\"H\":%.2f}",
-      temperature,
-      humidity);
-
-  if (payloadLength < 0 || payloadLength >= static_cast<int>(sizeof(payload)))
+  gateway::MqttSession session{};
+  gateway::adapter::PublishedAck ack{};
+  while (ackQueue.pop(&ack))
   {
-    return false;
+    registrationAck.observe(ack);
   }
-
-  return sendTelemetryPayload(payload, static_cast<size_t>(payloadLength));
+  session.registrationLost = ackQueue.takeOverflow();
+  if (session.registrationLost) registrationAck.invalidate();
+  session.connected = mqttConnected.load(std::memory_order_acquire);
+  session.generation = connectionGeneration;
+  session.registrationAcknowledged = registrationAck.isAcknowledged();
+  return session;
 }
 
-bool sendTelemetryPayload(const char *payload, size_t payloadLength)
+bool enqueueMqttPayload(const char *topic, const char *payload, size_t payloadLength, uint32_t generation)
 {
+  if (topic == nullptr || generation != connectionGeneration) return false;
   if (mqttClient == nullptr ||
       !mqttConnected.load(std::memory_order_acquire) ||
       payload == nullptr || payloadLength == 0U ||
@@ -191,7 +198,7 @@ bool sendTelemetryPayload(const char *payload, size_t payloadLength)
     return false;
   }
 
-  const size_t topicLength = strlen(MQTT_TELEMETRY_TOPIC);
+  const size_t topicLength = strlen(topic);
   size_t packetLength = 0U;
   if (!mqttQos1PacketSize(topicLength, payloadLength, &packetLength) ||
       packetLength > MQTT_OUTBOX_SOFT_LIMIT_BYTES)
@@ -212,7 +219,7 @@ bool sendTelemetryPayload(const char *payload, size_t payloadLength)
 
   const int messageId = esp_mqtt_client_enqueue(
       mqttClient,
-      MQTT_TELEMETRY_TOPIC,
+      topic,
       payload,
       static_cast<int>(payloadLength),
       1,
@@ -223,6 +230,13 @@ bool sendTelemetryPayload(const char *payload, size_t payloadLength)
     return false;
   }
 
+  if (strcmp(topic, gateway::GATEWAY_CONNECT_TOPIC) == 0)
+  {
+    registrationAck.expect(generation, messageId);
+  }
+  // A successful SDK handoff already owns the payload, even if reconnect raced
+  // enqueue. Report acceptance so the application cannot submit the same RAM
+  // entry again. The next observed session resets device registration.
   mqttAcceptedCount.fetch_add(1U, std::memory_order_relaxed);
   return true;
 }
