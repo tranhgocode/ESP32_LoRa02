@@ -15,7 +15,6 @@ REQUIRED_KEYS = (
     "MQTT_CLIENT_ID",
     "MQTT_USERNAME",
     "MQTT_PASSWORD",
-    "MQTT_TELEMETRY_TOPIC",
 )
 
 
@@ -83,7 +82,6 @@ header_lines = [
     f"#define MQTT_CLIENT_ID {json.dumps(config['MQTT_CLIENT_ID'])}",
     f"#define MQTT_USERNAME {json.dumps(config['MQTT_USERNAME'])}",
     f"#define MQTT_PASSWORD {json.dumps(config['MQTT_PASSWORD'])}",
-    f"#define MQTT_TELEMETRY_TOPIC {json.dumps(config['MQTT_TELEMETRY_TOPIC'])}",
     "",
 ]
 generated_header.write_text("\n".join(header_lines), encoding="utf-8")
