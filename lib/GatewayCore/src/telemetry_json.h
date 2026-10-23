@@ -1,6 +1,7 @@
 #pragma once
 
 #include "telemetry_sample.h"
+#include "sensor_registry.h"
 
 #include <stddef.h>
 
@@ -8,7 +9,7 @@ namespace gateway
 {
 // Capacity includes the terminating null byte. It is large enough for every
 // numeric extreme representable by TelemetrySample and keeps stack use bounded.
-constexpr size_t TELEMETRY_JSON_CAPACITY = 128U;
+constexpr size_t TELEMETRY_JSON_CAPACITY = 224U;
 
 /**
  * Serialize one telemetry sample to the gateway MQTT JSON schema.
@@ -29,4 +30,7 @@ bool serializeTelemetryJson(const TelemetrySample *sample,
                             char *output,
                             size_t outputCapacity,
                             size_t *outputLength);
+bool serializeGatewayTelemetryJson(const TelemetrySample *sample, const SensorRegistry *registry,
+    char *output, size_t capacity, size_t *length);
+bool serializeGatewayConnectJson(const SensorNodeConfig *config, char *output, size_t capacity, size_t *length);
 } // namespace gateway

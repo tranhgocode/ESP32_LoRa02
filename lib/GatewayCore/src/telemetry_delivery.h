@@ -1,6 +1,7 @@
 #pragma once
 
 #include "telemetry_buffer.h"
+#include "sensor_registry.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -48,6 +49,7 @@ using TelemetryPublishFunction = bool (*)(const char *payload,
  */
 TelemetryDeliveryResult deliverNextTelemetry(
     TelemetryBuffer *buffer,
+    const SensorRegistry *registry,
     TelemetryPublishFunction publish,
     void *publishContext);
 
@@ -57,6 +59,7 @@ TelemetryDeliveryResult deliverNextTelemetry(
  */
 TelemetryDeliveryResult serviceTelemetryDelivery(
     TelemetryBuffer *buffer,
+    const SensorRegistry *registry,
     TelemetryPublishFunction publish,
     void *publishContext,
     TelemetryDeliveryService *service,

@@ -15,7 +15,9 @@
 *.code-workspace
 
 # Local agent workspace
+AGENTS.md
 .agents/
+.agent/*
 .codex/
 
 # Generated firmware and compiler output
