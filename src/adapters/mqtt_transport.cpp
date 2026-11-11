@@ -15,8 +15,8 @@
 
 namespace
 {
-// ESP-IDF 4.4.7 stores queued MQTT packets in RAM. ESP-MQTT exposes no hard
-// outbox limit in this SDK, so this adapter enforces an 8 KiB soft ceiling.
+// Queued MQTT packets live in RAM. This adapter enforces an 8 KiB soft ceiling
+// before handing each packet to the SDK outbox.
 constexpr size_t MQTT_OUTBOX_SOFT_LIMIT_BYTES = 8U * 1024U;
 constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000UL;
 constexpr unsigned long MQTT_STATUS_LOG_INTERVAL_MS = 10000UL;
@@ -36,11 +36,12 @@ uint32_t lastLoggedAcceptedCount = 0U;
 uint32_t lastLoggedPublishedCount = 0U;
 
 /** Publish callbacks can run on the MQTT task, so readiness is atomic. */
-esp_err_t handleMqttEvent(esp_mqtt_event_handle_t event)
+void handleMqttEvent(void *, esp_event_base_t, int32_t, void *eventData)
 {
+  const auto event = static_cast<esp_mqtt_event_handle_t>(eventData);
   if (event == nullptr)
   {
-    return ESP_OK;
+    return;
   }
 
   if (event->event_id == MQTT_EVENT_CONNECTED)
@@ -63,8 +64,6 @@ esp_err_t handleMqttEvent(esp_mqtt_event_handle_t event)
     ackQueue.push(connectionGeneration.load(std::memory_order_acquire), event->msg_id);
     mqttPublishedCount.fetch_add(1U, std::memory_order_relaxed);
   }
-
-  return ESP_OK;
 }
 
 void connectWifi()
@@ -114,20 +113,29 @@ void initMqtt()
   connectWifi();
 
   esp_mqtt_client_config_t mqttConfig = {};
-  mqttConfig.host = MQTT_HOST;
-  mqttConfig.port = MQTT_PORT;
-  mqttConfig.client_id = MQTT_CLIENT_ID;
-  mqttConfig.username = MQTT_USERNAME;
-  mqttConfig.password = MQTT_PASSWORD;
-  mqttConfig.event_handle = handleMqttEvent;
-  mqttConfig.keepalive = 60;
-  mqttConfig.reconnect_timeout_ms = 5000;
-  mqttConfig.network_timeout_ms = 100;
+  mqttConfig.broker.address.hostname = MQTT_HOST;
+  mqttConfig.broker.address.port = MQTT_PORT;
+  mqttConfig.broker.address.transport = MQTT_TRANSPORT_OVER_TCP;
+  mqttConfig.credentials.client_id = MQTT_CLIENT_ID;
+  mqttConfig.credentials.username = MQTT_USERNAME;
+  mqttConfig.credentials.authentication.password = MQTT_PASSWORD;
+  mqttConfig.session.keepalive = 60;
+  mqttConfig.network.reconnect_timeout_ms = 5000;
+  mqttConfig.network.timeout_ms = 100;
 
   mqttClient = esp_mqtt_client_init(&mqttConfig);
   if (mqttClient == nullptr)
   {
     Serial.println("Error: Failed to initialize MQTT client");
+    return;
+  }
+
+  if (esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY,
+                                   handleMqttEvent, nullptr) != ESP_OK)
+  {
+    Serial.println("Error: Failed to register MQTT event handler");
+    esp_mqtt_client_destroy(mqttClient);
+    mqttClient = nullptr;
     return;
   }
 
@@ -206,7 +214,7 @@ bool enqueueMqttPayload(const char *topic, const char *payload, size_t payloadLe
     return false;
   }
 
-  // This SDK reports the current outbox bytes but does not impose a hard cap.
+  // Check current outbox bytes against the application's soft ceiling.
   // One application loop is the sole producer, so this check bounds our writes.
   const int currentOutboxBytes = esp_mqtt_client_get_outbox_size(mqttClient);
   if (currentOutboxBytes < 0 ||
