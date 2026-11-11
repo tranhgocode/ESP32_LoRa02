@@ -2,3 +2,6 @@
 	path = node_device/SAMD21_LoRa02
 	url = https://github.com/tranhgocode/SAMD21_LoRa02.git
 	branch = master
+[submodule "node_device/ESP32_NodeSensor"]
+	path = node_device/ESP32_NodeSensor
+	url = https://github.com/tranhgocode/ESP32_NodeSensor.git
