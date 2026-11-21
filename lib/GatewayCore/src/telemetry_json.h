@@ -7,30 +7,24 @@
 
 namespace gateway
 {
-// Capacity includes the terminating null byte. It is large enough for every
-// numeric extreme representable by TelemetrySample and keeps stack use bounded.
-constexpr size_t TELEMETRY_JSON_CAPACITY = 224U;
+// Includes the terminator and the longest device name with all optional fields.
+constexpr size_t TELEMETRY_JSON_CAPACITY = 320U;
 
 /**
  * Serialize one telemetry sample to the gateway MQTT JSON schema.
  *
- * The output contains node_id, sequence, temperature, humidity, rssi, and snr
- * in that stable order. Fixed-point source values are formatted with integer
- * arithmetic: temperature and humidity have one decimal digit, while SNR has
- * two digits so quarter-dB values remain exact. receivedAtMs is internal queue
- * metadata and is intentionally not published by the V1 schema.
+ * Includes the base fields, available PM2.5, and a complete forecast.
+ * Temperature and humidity have one decimal digit and SNR has two.
  *
- * JSON is first built in a fixed local buffer and copied only after snprintf
- * succeeds and the caller's capacity is sufficient. Therefore output and
- * outputLength remain unchanged on null arguments, formatting failure, or
- * truncation. A successful output is null-terminated and outputLength excludes
- * that terminator.
+ * Output and length stay unchanged on failure. On success the output is
+ * null-terminated and the returned length excludes the terminator.
  */
 bool serializeTelemetryJson(const TelemetrySample *sample,
                             char *output,
                             size_t outputCapacity,
                             size_t *outputLength);
+/** Wrap a sample under the device name and add batteryLevel when calibrated. */
 bool serializeGatewayTelemetryJson(const TelemetrySample *sample, const SensorRegistry *registry,
-    char *output, size_t capacity, size_t *length);
+                                   char *output, size_t capacity, size_t *length);
 bool serializeGatewayConnectJson(const SensorNodeConfig *config, char *output, size_t capacity, size_t *length);
 } // namespace gateway

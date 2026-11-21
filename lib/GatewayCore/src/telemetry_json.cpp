@@ -1,4 +1,5 @@
 #include "telemetry_json.h"
+#include "battery_level.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -7,15 +8,110 @@ namespace gateway
 {
 namespace
 {
-/**
- * Split a signed fixed-point value without overflowing on its minimum value.
- * raw is widened to int32_t before negation, so all int16_t and int8_t values
- * used by TelemetrySample have a representable positive magnitude.
- */
-uint32_t signedMagnitude(int32_t raw)
+/** Keep partial JSON private until the entire payload fits the output buffer. */
+template <size_t Capacity>
+class JsonBuffer
 {
-    return raw < 0 ? static_cast<uint32_t>(-raw)
-                   : static_cast<uint32_t>(raw);
+public:
+    template <typename... Args>
+    bool append(const char *format, Args... args)
+    {
+        const size_t available = Capacity - length;
+        const int written = snprintf(bytes + length, available, format, args...);
+        if (written < 0 || static_cast<size_t>(written) >= available)
+        {
+            return false;
+        }
+        length += static_cast<size_t>(written);
+        return true;
+    }
+
+    bool copyTo(char *output, size_t capacity, size_t *outputLength) const
+    {
+        if (length >= capacity)
+        {
+            return false;
+        }
+        memcpy(output, bytes, length + 1U);
+        *outputLength = length;
+        return true;
+    }
+
+private:
+    char bytes[Capacity] = {};
+    size_t length = 0U;
+};
+
+using TelemetryJson = JsonBuffer<TELEMETRY_JSON_CAPACITY>;
+
+// Widen the signed inputs before negation to support their full ranges.
+unsigned long magnitude(int32_t value)
+{
+    return static_cast<unsigned long>(value < 0 ? -value : value);
+}
+
+bool appendBaseTelemetry(TelemetryJson &json, const TelemetrySample &sample)
+{
+    const unsigned long temperature = magnitude(sample.temperatureX10);
+    const unsigned long humidity = sample.humidityX10;
+    const unsigned long snr = magnitude(sample.snrX4);
+
+    // Keep fixed-point values exact without floating-point formatting.
+    return json.append(
+        "{\"node_id\":%u,\"sequence\":%u,"
+        "\"temperature\":%s%lu.%lu,\"humidity\":%lu.%lu,"
+        "\"rssi\":%d,\"snr\":%s%lu.%02lu",
+        static_cast<unsigned int>(sample.nodeId),
+        static_cast<unsigned int>(sample.sequence),
+        sample.temperatureX10 < 0 ? "-" : "",
+        temperature / 10UL,
+        temperature % 10UL,
+        humidity / 10UL,
+        humidity % 10UL,
+        static_cast<int>(sample.rssi),
+        sample.snrX4 < 0 ? "-" : "",
+        snr / 4UL,
+        (snr % 4UL) * 25UL);
+}
+
+bool appendBatteryLevel(TelemetryJson &json, uint16_t millivolts, const BatteryCurve &curve)
+{
+    uint8_t percent = 0U;
+    return !calculateBatteryLevel(millivolts, curve, percent) ||
+           json.append(",\"batteryLevel\":%u", static_cast<unsigned int>(percent));
+}
+
+bool appendForecast(TelemetryJson &json, const uint16_t (&forecast)[PM25_FORECAST_COUNT])
+{
+    // Publish a forecast only when all four values came from the same report.
+    for (uint16_t value : forecast)
+    {
+        if (value == SENSOR_VALUE_UNAVAILABLE)
+        {
+            return true;
+        }
+    }
+    for (size_t step = 0U; step < PM25_FORECAST_COUNT; ++step)
+    {
+        if (!json.append(",\"pm25_forecast_step_%u\":%u",
+                         static_cast<unsigned int>(step + 1U),
+                         static_cast<unsigned int>(forecast[step])))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool appendTelemetry(TelemetryJson &json, const TelemetrySample &sample, const BatteryCurve &curve)
+{
+    const OptionalSensorData &data = sample.optional;
+    return appendBaseTelemetry(json, sample) &&
+           appendBatteryLevel(json, data.batteryMv, curve) &&
+           (data.pm25UgM3 == SENSOR_VALUE_UNAVAILABLE ||
+            json.append(",\"pm25\":%u", static_cast<unsigned int>(data.pm25UgM3))) &&
+           appendForecast(json, data.pm25Forecast) &&
+           json.append("}");
 }
 } // namespace
 
@@ -29,87 +125,41 @@ bool serializeTelemetryJson(const TelemetrySample *sample,
         return false;
     }
 
-    const int32_t temperatureRaw = sample->temperatureX10;
-    const uint32_t temperatureMagnitude = signedMagnitude(temperatureRaw);
-    const char *temperatureSign = temperatureRaw < 0 ? "-" : "";
-
-    const uint32_t humidityMagnitude = sample->humidityX10;
-
-    const int32_t snrRaw = sample->snrX4;
-    const uint32_t snrMagnitude = signedMagnitude(snrRaw);
-    const char *snrSign = snrRaw < 0 ? "-" : "";
-
-    // Build into private storage so snprintf truncation can never expose a
-    // partial JSON document to the MQTT adapter. Casts match each variadic
-    // format argument explicitly on both native and ESP32 builds.
-    char candidate[TELEMETRY_JSON_CAPACITY] = {};
-    const int written = snprintf(
-        candidate,
-        sizeof(candidate),
-        "{\"node_id\":%u,\"sequence\":%u,"
-        "\"temperature\":%s%lu.%lu,\"humidity\":%lu.%lu,"
-        "\"rssi\":%d,\"snr\":%s%lu.%02lu}",
-        static_cast<unsigned int>(sample->nodeId),
-        static_cast<unsigned int>(sample->sequence),
-        temperatureSign,
-        static_cast<unsigned long>(temperatureMagnitude / 10U),
-        static_cast<unsigned long>(temperatureMagnitude % 10U),
-        static_cast<unsigned long>(humidityMagnitude / 10U),
-        static_cast<unsigned long>(humidityMagnitude % 10U),
-        static_cast<int>(sample->rssi),
-        snrSign,
-        static_cast<unsigned long>(snrMagnitude / 4U),
-        static_cast<unsigned long>((snrMagnitude % 4U) * 25U));
-
-    // snprintf returns the number of bytes it wanted to write, excluding the
-    // terminator. A negative value is an encoding error; a value equal to or
-    // larger than capacity means the internal buffer was truncated.
-    if (written < 0 ||
-        static_cast<size_t>(written) >= sizeof(candidate))
-    {
-        return false;
-    }
-
-    const size_t payloadLength = static_cast<size_t>(written);
-    const size_t requiredCapacity = payloadLength + 1U;
-    if (outputCapacity < requiredCapacity)
-    {
-        return false;
-    }
-
-    // Include the null byte in the copy, then publish the byte length only
-    // after every possible failure has been ruled out.
-    memcpy(output, candidate, requiredCapacity);
-    *outputLength = payloadLength;
-    return true;
+    TelemetryJson json;
+    return appendTelemetry(json, *sample, BatteryCurve{}) &&
+           json.copyTo(output, outputCapacity, outputLength);
 }
+
 bool serializeGatewayTelemetryJson(const TelemetrySample *sample, const SensorRegistry *registry,
-    char *output, size_t capacity, size_t *length)
+                                   char *output, size_t capacity, size_t *length)
 {
-    if (sample == nullptr || output == nullptr || length == nullptr) return false;
+    if (sample == nullptr || output == nullptr || length == nullptr)
+    {
+        return false;
+    }
     const SensorNodeConfig *config = findNodeConfig(registry, sample->nodeId);
-    if (config == nullptr || !config->enabled || !isValidDeviceName(config->deviceName)) return false;
-    char values[TELEMETRY_JSON_CAPACITY] = {};
-    size_t valuesLength = 0U;
-    if (!serializeTelemetryJson(sample, values, sizeof(values), &valuesLength)) return false;
-    char candidate[TELEMETRY_JSON_CAPACITY] = {};
-    int written = snprintf(candidate, sizeof(candidate), "{\"%s\":[%s]}", config->deviceName, values);
-    if (written < 0 || static_cast<size_t>(written) >= sizeof(candidate) ||
-        static_cast<size_t>(written) >= capacity) return false;
-    memcpy(output, candidate, static_cast<size_t>(written) + 1U);
-    *length = static_cast<size_t>(written);
-    return true;
+    if (config == nullptr || !config->enabled || !isValidDeviceName(config->deviceName))
+    {
+        return false;
+    }
+
+    TelemetryJson json;
+    return json.append("{\"%s\":[", config->deviceName) &&
+           appendTelemetry(json, *sample, config->batteryCurve) &&
+           json.append("]}") &&
+           json.copyTo(output, capacity, length);
 }
+
 bool serializeGatewayConnectJson(const SensorNodeConfig *config, char *output, size_t capacity, size_t *length)
 {
     if (config == nullptr || output == nullptr || length == nullptr ||
-        !config->enabled || !isValidDeviceName(config->deviceName)) return false;
-    char candidate[DEVICE_NAME_CAPACITY + 16U] = {};
-    int written = snprintf(candidate, sizeof(candidate), "{\"device\":\"%s\"}", config->deviceName);
-    if (written < 0 || static_cast<size_t>(written) >= sizeof(candidate) ||
-        static_cast<size_t>(written) >= capacity) return false;
-    memcpy(output, candidate, static_cast<size_t>(written) + 1U);
-    *length = static_cast<size_t>(written);
-    return true;
+        !config->enabled || !isValidDeviceName(config->deviceName))
+    {
+        return false;
+    }
+
+    JsonBuffer<DEVICE_NAME_CAPACITY + 16U> json;
+    return json.append("{\"device\":\"%s\"}", config->deviceName) &&
+           json.copyTo(output, capacity, length);
 }
 } // namespace gateway
