@@ -26,6 +26,8 @@ TelemetryDeliveryResult deliverNextTelemetry(
     if (!serializeGatewayTelemetryJson(
             sample, registry, payload, sizeof(payload), &payloadLength))
     {
+        // The same sample would fail again and block all subsequent readings.
+        discardTelemetrySample(buffer);
         return TelemetryDeliveryResult::EncodingFailed;
     }
 
@@ -63,8 +65,7 @@ TelemetryDeliveryResult serviceTelemetryDelivery(
 
     const TelemetryDeliveryResult result = deliverNextTelemetry(
         buffer, registry, publish, publishContext);
-    if (result == TelemetryDeliveryResult::PublishRejected ||
-        result == TelemetryDeliveryResult::EncodingFailed)
+    if (result == TelemetryDeliveryResult::PublishRejected)
     {
         service->retryPending = true;
         service->retryAtMs = nowMs + TELEMETRY_DELIVERY_RETRY_INTERVAL_MS;

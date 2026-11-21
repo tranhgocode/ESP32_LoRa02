@@ -44,7 +44,7 @@ bool pushTelemetrySample(TelemetryBuffer *buffer,
     if (buffer->count == TELEMETRY_BUFFER_CAPACITY)
     {
         // In a full ring, head is also the next write slot. Replacing it drops
-        // exactly the oldest sample; moving head then makes the following item
+        // exactly the oldest sample. Moving head then makes the following item
         // the oldest and leaves the newly-written item at the logical tail.
         buffer->samples[buffer->head] = *sample;
         buffer->head = nextIndex(buffer->head);
@@ -93,6 +93,16 @@ bool popTelemetrySample(TelemetryBuffer *buffer)
         buffer->head = 0U;
     }
 
+    return true;
+}
+
+bool discardTelemetrySample(TelemetryBuffer *buffer)
+{
+    if (!popTelemetrySample(buffer))
+    {
+        return false;
+    }
+    incrementSaturating(&buffer->telemetryDropped);
     return true;
 }
 

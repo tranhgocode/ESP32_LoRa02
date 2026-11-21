@@ -33,8 +33,8 @@ constexpr uint32_t TELEMETRY_DELIVERY_RETRY_INTERVAL_MS = 1000U;
  *
  * Returning true transfers ownership of this payload to the publisher. The
  * payload bytes are valid only for the duration of the call, so an async
- * adapter must copy them before returning true. The callback can block; the
- * application must schedule it where that wait cannot interrupt radio work.
+ * adapter must copy them before returning true. The callback can block, so
+ * the application schedules it where that wait cannot interrupt radio work.
  */
 using TelemetryPublishFunction = bool (*)(const char *payload,
                                           size_t payloadLength,
@@ -43,9 +43,8 @@ using TelemetryPublishFunction = bool (*)(const char *payload,
 /**
  * Serialize and offer at most the oldest queued sample to a publisher.
  *
- * The FIFO head is removed only after the publisher accepts the complete JSON
- * payload. Empty queues and failures leave the buffer unchanged, allowing the
- * caller to retry on a later service iteration without reordering samples.
+ * A successful handoff removes the oldest sample. An encoding failure discards
+ * and counts that sample. Publisher rejection leaves it queued for retry.
  */
 TelemetryDeliveryResult deliverNextTelemetry(
     TelemetryBuffer *buffer,
@@ -55,7 +54,7 @@ TelemetryDeliveryResult deliverNextTelemetry(
 
 /**
  * Service at most one queue item. Rejections schedule the next attempt one
- * second later; successful sends may continue on the next loop iteration.
+ * second later. Processing can continue on the next loop after other results.
  */
 TelemetryDeliveryResult serviceTelemetryDelivery(
     TelemetryBuffer *buffer,

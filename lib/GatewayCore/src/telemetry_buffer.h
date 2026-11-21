@@ -15,8 +15,8 @@ constexpr size_t TELEMETRY_BUFFER_CAPACITY = 64U;
  * Fixed-capacity FIFO storage for telemetry waiting to be handed to MQTT.
  *
  * head points to the oldest readable sample and count describes how many
- * entries are currently valid. telemetryDropped is public diagnostic state;
- * callers should mutate the queue itself only through the functions below so
+ * entries are currently valid. telemetryDropped counts discarded samples.
+ * Callers should mutate the queue itself only through the functions below so
  * the ring invariants remain valid. Value initialization creates an empty,
  * ready-to-use queue without heap allocation or a separate init function.
  */
@@ -57,6 +57,9 @@ const TelemetrySample *peekTelemetrySample(const TelemetryBuffer *buffer);
  * Returns false for a null or empty buffer and leaves all state unchanged.
  */
 bool popTelemetrySample(TelemetryBuffer *buffer);
+
+/** Discard the oldest sample and count the loss if a sample was present. */
+bool discardTelemetrySample(TelemetryBuffer *buffer);
 
 /**
  * Make the queue reusable from its initial state.
