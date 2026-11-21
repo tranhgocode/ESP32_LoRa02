@@ -1,5 +1,7 @@
 #pragma once
 
+#include "sensor_data.h"
+
 #include <stdint.h>
 
 namespace gateway
@@ -22,5 +24,6 @@ struct TelemetrySample
     int16_t rssi = 0;
     int8_t snrX4 = 0;
     uint32_t receivedAtMs = 0U;
+    OptionalSensorData optional{};
 };
 } // namespace gateway

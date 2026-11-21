@@ -8,6 +8,93 @@ namespace
 constexpr int16_t MIN_TEMPERATURE_X10 = -400;
 constexpr int16_t MAX_TEMPERATURE_X10 = 800;
 constexpr uint16_t MAX_HUMIDITY_X10 = 1000U;
+
+bool buildTelemetrySample(const PacketMessage &packet, const UplinkEvent &event,
+                          TelemetrySample &sample)
+{
+    SensorData data{};
+    if (!decodeDataPayload(&packet, &data) ||
+        data.temperatureX10 < MIN_TEMPERATURE_X10 ||
+        data.temperatureX10 > MAX_TEMPERATURE_X10 ||
+        data.humidityX10 > MAX_HUMIDITY_X10)
+    {
+        return false;
+    }
+
+    sample.nodeId = packet.source;
+    sample.sequence = packet.sequence;
+    sample.temperatureX10 = data.temperatureX10;
+    sample.humidityX10 = data.humidityX10;
+    sample.rssi = event.rssi;
+    sample.snrX4 = event.snrX4;
+    sample.receivedAtMs = event.nowMs;
+    // Copy all optional fields so a short report clears values from older reports.
+    sample.optional = data.optional;
+    return true;
+}
+
+UplinkAction receiveReport(UplinkCoordinator &coordinator, const SensorRegistry &registry,
+                           const UplinkEvent &event)
+{
+    PacketMessage packet{};
+    if (event.type != UplinkEventType::FrameReceived ||
+        !decodePacket(event.frame, event.frameLength, &packet) ||
+        (packet.type != PacketType::Data && packet.type != PacketType::Error))
+    {
+        return UplinkAction{};
+    }
+    const SensorNodeConfig *config = findNodeConfig(&registry, packet.source);
+    if (config == nullptr || !config->enabled)
+    {
+        return UplinkAction{};
+    }
+
+    UplinkAction action{};
+    if (packet.type == PacketType::Data)
+    {
+        if (!buildTelemetrySample(packet, event, action.sample))
+        {
+            return UplinkAction{};
+        }
+        action.hasSample = true;
+    }
+    else if (!decodeErrorPayload(&packet, &action.errorCode))
+    {
+        return UplinkAction{};
+    }
+    action.type = UplinkActionType::RecordReport;
+    action.packet = packet;
+    action.rssi = event.rssi;
+    action.snrX4 = event.snrX4;
+    action.receivedAtMs = event.nowMs;
+    coordinator.pendingReport = packet;
+    coordinator.phase = UplinkPhase::AwaitingRecord;
+    return action;
+}
+
+UplinkAction handleRecordResult(UplinkCoordinator &coordinator, UplinkEventType eventType)
+{
+    if (eventType == UplinkEventType::ReportRejected)
+    {
+        initializeUplinkCoordinator(&coordinator);
+    }
+    if (eventType != UplinkEventType::ReportAccepted)
+    {
+        return UplinkAction{};
+    }
+
+    // Echo the identifiers only after the application records the report.
+    const PacketMessage &report = coordinator.pendingReport;
+    UplinkAction action{};
+    action.type = UplinkActionType::SendAck;
+    action.packet.type = PacketType::Ack;
+    action.packet.source = GATEWAY_ADDRESS;
+    action.packet.destination = report.source;
+    action.packet.transactionId = report.transactionId;
+    action.packet.sequence = report.sequence;
+    coordinator.phase = UplinkPhase::AckTxPending;
+    return action;
+}
 } // namespace
 
 void initializeUplinkCoordinator(UplinkCoordinator *coordinator)
@@ -26,89 +113,23 @@ UplinkAction handleUplinkEvent(UplinkCoordinator *coordinator, const SensorRegis
         return UplinkAction{};
     }
 
-    if (coordinator->phase == UplinkPhase::AwaitingRecord)
+    switch (coordinator->phase)
     {
-        if (event->type == UplinkEventType::ReportRejected)
-        {
-            initializeUplinkCoordinator(coordinator);
-        }
-        else if (event->type == UplinkEventType::ReportAccepted)
-        {
-            UplinkAction action{};
-            action.type = UplinkActionType::SendAck;
-            action.packet.type = PacketType::Ack;
-            action.packet.source = GATEWAY_ADDRESS;
-            action.packet.destination = coordinator->pendingReport.source;
-            action.packet.transactionId = coordinator->pendingReport.transactionId;
-            action.packet.sequence = coordinator->pendingReport.sequence;
-            coordinator->phase = UplinkPhase::AckTxPending;
-            return action;
-        }
-        return UplinkAction{};
-    }
-    if (coordinator->phase == UplinkPhase::AckTxPending)
-    {
+    case UplinkPhase::Idle:
+        return receiveReport(*coordinator, *registry, *event);
+    case UplinkPhase::AwaitingRecord:
+        return handleRecordResult(*coordinator, event->type);
+    case UplinkPhase::AckTxPending:
         if (event->type == UplinkEventType::AckTxSucceeded ||
             event->type == UplinkEventType::AckTxFailed)
         {
             initializeUplinkCoordinator(coordinator);
         }
-        return UplinkAction{};
-    }
-    if (coordinator->phase != UplinkPhase::Idle)
-    {
+        break;
+    default:
         initializeUplinkCoordinator(coordinator);
-        return UplinkAction{};
+        break;
     }
-    if (event->type != UplinkEventType::FrameReceived)
-    {
-        return UplinkAction{};
-    }
-
-    PacketMessage packet{};
-    if (!decodePacket(event->frame, event->frameLength, &packet) ||
-        packet.destination != GATEWAY_ADDRESS ||
-        (packet.type != PacketType::Data && packet.type != PacketType::Error))
-    {
-        return UplinkAction{};
-    }
-    const SensorNodeConfig *config = findNodeConfig(registry, packet.source);
-    if (config == nullptr || !config->enabled)
-    {
-        return UplinkAction{};
-    }
-
-    UplinkAction action{};
-    if (packet.type == PacketType::Data)
-    {
-        int16_t temperature = 0;
-        uint16_t humidity = 0;
-        if (!decodeDataPayload(&packet, &temperature, &humidity) ||
-            temperature < MIN_TEMPERATURE_X10 || temperature > MAX_TEMPERATURE_X10 ||
-            humidity > MAX_HUMIDITY_X10)
-        {
-            return UplinkAction{};
-        }
-        action.hasSample = true;
-        action.sample.nodeId = packet.source;
-        action.sample.sequence = packet.sequence;
-        action.sample.temperatureX10 = temperature;
-        action.sample.humidityX10 = humidity;
-        action.sample.rssi = event->rssi;
-        action.sample.snrX4 = event->snrX4;
-        action.sample.receivedAtMs = event->nowMs;
-    }
-    else if (!decodeErrorPayload(&packet, &action.errorCode))
-    {
-        return UplinkAction{};
-    }
-    action.type = UplinkActionType::RecordReport;
-    action.packet = packet;
-    action.rssi = event->rssi;
-    action.snrX4 = event->snrX4;
-    action.receivedAtMs = event->nowMs;
-    coordinator->pendingReport = packet;
-    coordinator->phase = UplinkPhase::AwaitingRecord;
-    return action;
+    return UplinkAction{};
 }
 } // namespace gateway

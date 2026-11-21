@@ -37,7 +37,7 @@ struct UplinkEvent
     int8_t snrX4 = 0;
 };
 
-/** RecordReport proposes validated data; it does not authorize ACK yet.
+/** RecordReport proposes validated data for recording before ACK.
  * Main must record/log it and report acceptance or rejection synchronously.
  * ERROR has report metadata and an error code, but never a DATA sample.
  */
@@ -62,7 +62,7 @@ struct UplinkCoordinator
 void initializeUplinkCoordinator(UplinkCoordinator *coordinator);
 
 /** Pure transition: no clock, registry mutation, radio, queue or network calls.
- * One report/ACK slot; incoming frames while occupied are ignored. There is no
+ * One report/ACK slot ignores incoming frames while occupied. There is no
  * sequence deduplication: reset, wrap and repeated ID/Seq remain valid reports.
  * Both ACK completion outcomes release the slot without replaying the sample.
  */
