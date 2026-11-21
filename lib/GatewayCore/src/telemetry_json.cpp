@@ -8,6 +8,8 @@ namespace gateway
 {
 namespace
 {
+constexpr uint16_t FORECAST_SEQUENCE_INTERVAL = 24U;
+
 /** Keep partial JSON private until the entire payload fits the output buffer. */
 template <size_t Capacity>
 class JsonBuffer
@@ -81,9 +83,16 @@ bool appendBatteryLevel(TelemetryJson &json, uint16_t millivolts, const BatteryC
            json.append(",\"batteryLevel\":%u", static_cast<unsigned int>(percent));
 }
 
-bool appendForecast(TelemetryJson &json, const uint16_t (&forecast)[PM25_FORECAST_COUNT])
+bool appendForecast(TelemetryJson &json, const TelemetrySample &sample)
 {
-    // Publish a forecast only when all four values came from the same report.
+    // Sequence starts at zero, so the first 24-slot window ends at Seq 23.
+    if (sample.sequence % FORECAST_SEQUENCE_INTERVAL != FORECAST_SEQUENCE_INTERVAL - 1U)
+    {
+        return true;
+    }
+
+    // Publish a forecast only when all four values came from this report.
+    const auto &forecast = sample.optional.pm25Forecast;
     for (uint16_t value : forecast)
     {
         if (value == SENSOR_VALUE_UNAVAILABLE)
@@ -110,7 +119,7 @@ bool appendTelemetry(TelemetryJson &json, const TelemetrySample &sample, const B
            appendBatteryLevel(json, data.batteryMv, curve) &&
            (data.pm25UgM3 == SENSOR_VALUE_UNAVAILABLE ||
             json.append(",\"pm25\":%u", static_cast<unsigned int>(data.pm25UgM3))) &&
-           appendForecast(json, data.pm25Forecast) &&
+           appendForecast(json, sample) &&
            json.append("}");
 }
 } // namespace
