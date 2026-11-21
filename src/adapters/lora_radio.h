@@ -8,7 +8,7 @@ namespace gateway
 namespace adapter
 {
 // The transport capacity matches the maximum V1 frame. Protocol validation is
-// intentionally left to GatewayCore; this adapter only bounds byte movement.
+// handled by GatewayCore. This adapter bounds byte movement.
 constexpr size_t LORA_RADIO_FRAME_CAPACITY = 64U;
 
 /** Result of initializing the SPI bus and SX127x-compatible LoRa radio. */
@@ -74,7 +74,7 @@ LoRaRadioInitResult initializeLoRaRadio();
  * Start sending one byte frame without waiting for the radio to finish.
  *
  * The request is rejected for null/empty/oversized input, an uninitialized
- * radio, a transmission already in progress, or a short/failed driver write.
+ * radio or a transmission already in progress.
  * The input is copied into the SX127x FIFO before this function returns, so the
  * caller does not need to preserve the buffer while transmission is active.
  */
@@ -85,9 +85,8 @@ LoRaTransmitStartResult startLoRaTransmit(const uint8_t *frame,
  * Service at most one TX completion, TX watchdog, or received frame.
  *
  * This function never waits for radio activity. It returns true only when a
- * complete event was assigned to output; false leaves the caller's output
- * unchanged. Oversized and short driver reads are fully drained, reported as
- * FrameDropped, and never exposed as a partial protocol frame.
+ * complete event was assigned to output. CRC errors and unsupported radio
+ * lengths are reported as FrameDropped without exposing a partial frame.
  */
 bool serviceLoRaRadio(LoRaRadioEvent *output);
 
@@ -96,6 +95,9 @@ bool isLoRaRadioReady();
 
 /** Let main.cpp avoid issuing a second request while async TX is in progress. */
 bool isLoRaTransmitPending();
+
+/** Read the SX127x RegOpMode byte for the periodic radio status. */
+uint8_t readLoRaOperatingMode();
 
 /** Stable diagnostic label for initialization logs without dynamic allocation. */
 const char *loRaRadioInitResultName(LoRaRadioInitResult result);

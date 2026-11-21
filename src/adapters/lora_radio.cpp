@@ -14,201 +14,228 @@ namespace adapter
 {
 namespace
 {
-/** Internal ownership state prevents concurrent use of the single SX127x FIFO. */
+// SX127x LoRa registers used to poll events and move complete FIFO frames.
+constexpr uint8_t REG_FIFO = 0x00U;
+constexpr uint8_t REG_OP_MODE = 0x01U;
+constexpr uint8_t REG_FIFO_POINTER = 0x0DU;
+constexpr uint8_t REG_FIFO_TX_BASE = 0x0EU;
+constexpr uint8_t REG_FIFO_RX_CURRENT = 0x10U;
+constexpr uint8_t REG_IRQ_FLAGS = 0x12U;
+constexpr uint8_t REG_RX_LENGTH = 0x13U;
+constexpr uint8_t REG_MODEM_CONFIG_1 = 0x1DU;
+constexpr uint8_t REG_TX_LENGTH = 0x22U;
+
+constexpr uint8_t SPI_WRITE = 0x80U;
+constexpr uint8_t LORA_MODE = 0x80U;
+constexpr uint8_t LOW_FREQUENCY_MODE = 0x08U;
+constexpr uint8_t IMPLICIT_HEADER = 0x01U;
+constexpr uint8_t IRQ_RX_DONE = 0x40U;
+constexpr uint8_t IRQ_PAYLOAD_CRC_ERROR = 0x20U;
+constexpr uint8_t IRQ_TX_DONE = 0x08U;
+constexpr uint8_t IRQ_CLEAR_ALL = 0xFFU;
+constexpr uint32_t RADIO_SPI_HZ = 8000000U;
+
+enum class RadioMode : uint8_t
+{
+    Sleep = 0x00U,
+    Standby = 0x01U,
+    Tx = 0x03U,
+    ContinuousRx = 0x05U
+};
+
 enum class RadioState : uint8_t
 {
-    Uninitialized = 0U,
+    Uninitialized,
     Receiving,
     Transmitting
 };
 
 RadioState radioState = RadioState::Uninitialized;
-volatile bool transmitDoneInterrupt = false;
 uint32_t transmitStartedAtMs = 0U;
 
-/**
- * DIO0 callbacks run in interrupt context in arduino-LoRa 0.8.0. The callback
- * therefore records only a volatile flag; SPI access, state transitions, and
- * event construction remain in serviceLoRaRadio() in the application loop.
- *
- * Source: https://github.com/sandeepmistry/arduino-LoRa/blob/0.8.0/API.md#tx-done
- */
-void IRAM_ATTR handleTransmitDoneInterrupt()
+void selectRegister(uint8_t command)
 {
-    transmitDoneInterrupt = true;
+    SPI.beginTransaction(SPISettings(RADIO_SPI_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(LORA_NSS, LOW);
+    SPI.transfer(command);
 }
 
-/**
- * Detach the TX callback before mapping DIO0 back to RXDONE. Leaving the
- * callback attached would let the library ISR clear an RX interrupt before the
- * polling path can observe it through parsePacket().
- */
-void restoreReceiveMode()
+void releaseRadio()
 {
-    LoRa.onTxDone(nullptr);
-    LoRa.receive();
+    digitalWrite(LORA_NSS, HIGH);
+    SPI.endTransaction();
+}
+
+uint8_t readRegister(uint8_t address)
+{
+    selectRegister(address);
+    const uint8_t value = SPI.transfer(0U);
+    releaseRadio();
+    return value;
+}
+
+void writeRegister(uint8_t address, uint8_t value)
+{
+    selectRegister(address | SPI_WRITE);
+    SPI.transfer(value);
+    releaseRadio();
+}
+
+void setRadioMode(RadioMode mode)
+{
+    // Preserve the same 433 MHz operating mode as ESP32_NodeSensor.
+    writeRegister(REG_OP_MODE, LORA_MODE | LOW_FREQUENCY_MODE | static_cast<uint8_t>(mode));
+}
+
+void startReceive()
+{
+    setRadioMode(RadioMode::ContinuousRx);
     radioState = RadioState::Receiving;
 }
 
-/** Clamp the driver's integer RSSI to the fixed event representation. */
-int16_t clampRssi(int rssi)
+void readFrame(uint8_t *frame, size_t length)
 {
-    if (rssi < INT16_MIN)
+    writeRegister(REG_FIFO_POINTER, readRegister(REG_FIFO_RX_CURRENT));
+    selectRegister(REG_FIFO);
+    for (size_t index = 0U; index < length; ++index)
+    {
+        frame[index] = SPI.transfer(0U);
+    }
+    releaseRadio();
+}
+
+void writeFrame(const uint8_t *frame, size_t length)
+{
+    writeRegister(REG_FIFO_POINTER, readRegister(REG_FIFO_TX_BASE));
+    selectRegister(REG_FIFO | SPI_WRITE);
+    for (size_t index = 0U; index < length; ++index)
+    {
+        SPI.transfer(frame[index]);
+    }
+    releaseRadio();
+    writeRegister(REG_TX_LENGTH, static_cast<uint8_t>(length));
+}
+
+int16_t clampRssi(int value)
+{
+    if (value < INT16_MIN)
     {
         return INT16_MIN;
     }
-
-    if (rssi > INT16_MAX)
+    if (value > INT16_MAX)
     {
         return INT16_MAX;
     }
-
-    return static_cast<int16_t>(rssi);
+    return static_cast<int16_t>(value);
 }
 
-/**
- * arduino-LoRa reports SNR in exact 0.25 dB steps. Scaling by four preserves
- * the signed register value used by GatewayCore and avoids float state in the
- * event/action boundary.
- */
 int8_t readSnrX4()
 {
-    const int scaledSnr = static_cast<int>(LoRa.packetSnr() * 4.0F);
-    if (scaledSnr < INT8_MIN)
+    const int value = static_cast<int>(LoRa.packetSnr() * 4.0F);
+    if (value < INT8_MIN)
     {
         return INT8_MIN;
     }
-
-    if (scaledSnr > INT8_MAX)
+    if (value > INT8_MAX)
     {
         return INT8_MAX;
     }
-
-    return static_cast<int8_t>(scaledSnr);
+    return static_cast<int8_t>(value);
 }
 
-/**
- * Drain the entire FIFO once parsePacket() reports a packet. Only an exact,
- * bounded read becomes FrameReceived; every mismatch becomes FrameDropped so
- * no stale or partial bytes can reach the V1 decoder.
- */
-LoRaRadioEvent readReceivedFrame(int reportedLength)
+LoRaRadioEvent finishReceive(uint8_t flags)
 {
+    // Freeze the completed FIFO frame while reading it, then resume reception.
+    setRadioMode(RadioMode::Standby);
+    writeRegister(REG_IRQ_FLAGS, flags);
+
     LoRaRadioEvent event{};
-    event.frameLength = static_cast<size_t>(reportedLength);
-    event.rssi = clampRssi(LoRa.packetRssi());
-    event.snrX4 = readSnrX4();
-
-    size_t bytesRead = 0U;
-    while (LoRa.available() > 0)
+    event.frameLength = readRegister(REG_RX_LENGTH);
+    if ((flags & IRQ_PAYLOAD_CRC_ERROR) != 0U ||
+        event.frameLength == 0U || event.frameLength > LORA_RADIO_FRAME_CAPACITY)
     {
-        const int value = LoRa.read();
-        if (value < 0)
-        {
-            break;
-        }
+        event.type = LoRaRadioEventType::FrameDropped;
+    }
+    else
+    {
+        event.type = LoRaRadioEventType::FrameReceived;
+        event.rssi = clampRssi(LoRa.packetRssi());
+        event.snrX4 = readSnrX4();
+        readFrame(event.frame, event.frameLength);
+    }
+    startReceive();
+    return event;
+}
 
-        if (bytesRead < LORA_RADIO_FRAME_CAPACITY)
-        {
-            event.frame[bytesRead] = static_cast<uint8_t>(value);
-        }
-        ++bytesRead;
+bool serviceTransmit(uint8_t flags, LoRaRadioEvent &event)
+{
+    const bool finished = (flags & IRQ_TX_DONE) != 0U;
+    const uint32_t now = millis();
+    if (!finished && now - transmitStartedAtMs < LORA_TX_TIMEOUT_MS)
+    {
+        return false;
     }
 
-    // parsePacket() moves the radio to standby for a completed packet. Restore
-    // RX immediately after draining so processing in main cannot create a deaf
-    // interval longer than this bounded service call.
-    LoRa.receive();
+    setRadioMode(RadioMode::Standby);
+    writeRegister(REG_IRQ_FLAGS, IRQ_CLEAR_ALL);
+    startReceive();
+    event.type = finished ? LoRaRadioEventType::TransmitSucceeded
+                          : LoRaRadioEventType::TransmitFailed;
+    return true;
+}
 
-    const bool completeBoundedFrame =
-        event.frameLength <= LORA_RADIO_FRAME_CAPACITY &&
-        bytesRead == event.frameLength;
-    event.type = completeBoundedFrame
-                     ? LoRaRadioEventType::FrameReceived
-                     : LoRaRadioEventType::FrameDropped;
-    return event;
+void configureModem()
+{
+    setRadioMode(RadioMode::Sleep);
+    setRadioMode(RadioMode::Standby);
+    LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
+    LoRa.setSignalBandwidth(LORA_SIGNAL_BANDWIDTH);
+    LoRa.setCodingRate4(LORA_CODING_RATE_DENOMINATOR);
+    LoRa.setPreambleLength(LORA_PREAMBLE_SYMBOLS);
+    LoRa.disableInvertIQ();
+    LoRa.enableCrc();
+    LoRa.setSyncWord(LORA_SYNC_WORD);
+    writeRegister(REG_MODEM_CONFIG_1, readRegister(REG_MODEM_CONFIG_1) & ~IMPLICIT_HEADER);
+    writeRegister(REG_IRQ_FLAGS, IRQ_CLEAR_ALL);
 }
 } // namespace
 
 LoRaRadioInitResult initializeLoRaRadio()
 {
-    // Preserve the deployed SPI pins and register DIO0 before LoRa.begin(), as
-    // required by the library's pin configuration API.
+    radioState = RadioState::Uninitialized;
     SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
     LoRa.setPins(LORA_NSS, LORA_RESET, LORA_DIO0);
-
-    transmitDoneInterrupt = false;
-    transmitStartedAtMs = 0U;
-    radioState = RadioState::Uninitialized;
-
     if (LoRa.begin(LORA_FREQUENCY) == 0)
     {
         return LoRaRadioInitResult::RadioNotFound;
     }
 
-    // These values intentionally match the previous gateway and sensor radio
-    // contract. Hardware CRC filters damaged physical packets before the V1
-    // application CRC performs its own end-to-end frame validation.
-    LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
-    LoRa.setSignalBandwidth(LORA_SIGNAL_BANDWIDTH);
-    LoRa.setCodingRate4(LORA_CODING_RATE_DENOMINATOR);
-    LoRa.enableCrc();
-    LoRa.setSyncWord(LORA_SYNC_WORD);
-
-    restoreReceiveMode();
+    configureModem();
+    startReceive();
     return LoRaRadioInitResult::Ok;
 }
 
-LoRaTransmitStartResult startLoRaTransmit(const uint8_t *frame,
-                                          size_t frameLength)
+LoRaTransmitStartResult startLoRaTransmit(const uint8_t *frame, size_t frameLength)
 {
-    if (frame == nullptr || frameLength == 0U ||
-        frameLength > LORA_RADIO_FRAME_CAPACITY)
+    if (frame == nullptr || frameLength == 0U || frameLength > LORA_RADIO_FRAME_CAPACITY)
     {
         return LoRaTransmitStartResult::InvalidArgument;
     }
-
     if (radioState == RadioState::Uninitialized)
     {
         return LoRaTransmitStartResult::NotReady;
     }
-
     if (radioState == RadioState::Transmitting)
     {
         return LoRaTransmitStartResult::Busy;
     }
 
-    // beginPacket() returns zero if the radio is busy. write() returns the exact
-    // accepted byte count, so a short write is detected before TX is started.
-    if (LoRa.beginPacket() == 0)
-    {
-        restoreReceiveMode();
-        return LoRaTransmitStartResult::DriverRejected;
-    }
-
-    if (LoRa.write(frame, frameLength) != frameLength)
-    {
-        LoRa.idle();
-        restoreReceiveMode();
-        return LoRaTransmitStartResult::DriverRejected;
-    }
-
-    transmitDoneInterrupt = false;
-    LoRa.onTxDone(handleTransmitDoneInterrupt);
-    radioState = RadioState::Transmitting;
+    setRadioMode(RadioMode::Standby);
+    writeRegister(REG_IRQ_FLAGS, IRQ_CLEAR_ALL);
+    writeFrame(frame, frameLength);
     transmitStartedAtMs = millis();
-
-    // async=true is the documented nonblocking mode. The registered DIO0
-    // callback turns completion into a flag that serviceLoRaRadio() consumes.
-    // Source: https://github.com/sandeepmistry/arduino-LoRa/blob/0.8.0/API.md#end-packet
-    if (LoRa.endPacket(true) == 0)
-    {
-        LoRa.idle();
-        transmitDoneInterrupt = false;
-        restoreReceiveMode();
-        return LoRaTransmitStartResult::DriverRejected;
-    }
-
+    radioState = RadioState::Transmitting;
+    setRadioMode(RadioMode::Tx);
     return LoRaTransmitStartResult::Started;
 }
 
@@ -219,46 +246,24 @@ bool serviceLoRaRadio(LoRaRadioEvent *output)
         return false;
     }
 
-    LoRaRadioEvent event{};
-
+    // Read only IRQ flags while listening so RX stays in continuous mode.
+    const uint8_t flags = readRegister(REG_IRQ_FLAGS);
     if (radioState == RadioState::Transmitting)
     {
-        // Completion wins if it arrives at the watchdog boundary. This avoids
-        // reporting a false failure when DIO0 was already observed by the ISR.
-        if (transmitDoneInterrupt)
+        LoRaRadioEvent event{};
+        if (!serviceTransmit(flags, event))
         {
-            transmitDoneInterrupt = false;
-            restoreReceiveMode();
-            event.type = LoRaRadioEventType::TransmitSucceeded;
-            *output = event;
-            return true;
+            return false;
         }
-
-        if (millis() - transmitStartedAtMs >= LORA_TX_TIMEOUT_MS)
-        {
-            // Stop a TX whose DIO0 completion was never observed, detach the
-            // interrupt callback, and return to RX before reporting failure.
-            LoRa.idle();
-            transmitDoneInterrupt = false;
-            restoreReceiveMode();
-            event.type = LoRaRadioEventType::TransmitFailed;
-            *output = event;
-            return true;
-        }
-
-        return false;
+        *output = event;
+        return true;
     }
-
-    // parsePacket() only inspects radio state/registers and returns zero when no
-    // packet is ready; it does not wait for a future packet.
-    const int packetLength = LoRa.parsePacket();
-    if (packetLength <= 0)
+    if ((flags & IRQ_RX_DONE) == 0U)
     {
         return false;
     }
 
-    event = readReceivedFrame(packetLength);
-    *output = event;
+    *output = finishReceive(flags);
     return true;
 }
 
@@ -270,6 +275,11 @@ bool isLoRaRadioReady()
 bool isLoRaTransmitPending()
 {
     return radioState == RadioState::Transmitting;
+}
+
+uint8_t readLoRaOperatingMode()
+{
+    return readRegister(REG_OP_MODE);
 }
 
 const char *loRaRadioInitResultName(LoRaRadioInitResult result)
