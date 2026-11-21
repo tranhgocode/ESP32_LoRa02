@@ -15,168 +15,213 @@
 
 namespace
 {
-// Queued MQTT packets live in RAM. This adapter enforces an 8 KiB soft ceiling
-// before handing each packet to the SDK outbox.
-constexpr size_t MQTT_OUTBOX_SOFT_LIMIT_BYTES = 8U * 1024U;
-constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000UL;
-constexpr unsigned long MQTT_STATUS_LOG_INTERVAL_MS = 10000UL;
+  // Queued MQTT packets live in RAM. This adapter enforces an 8 KiB soft ceiling
+  // before handing each packet to the SDK outbox.
+  constexpr size_t MQTT_OUTBOX_SOFT_LIMIT_BYTES = 8U * 1024U;
+  constexpr uint32_t WIFI_STATUS_LOG_INTERVAL_MS = 10000U;
+  constexpr uint32_t MQTT_STATUS_LOG_INTERVAL_MS = 10000U;
+  constexpr uint32_t MQTT_START_RETRY_INTERVAL_MS = 5000U;
+  constexpr int MQTT_RECONNECT_INTERVAL_MS = 5000;
+  // Allow for an Internet round trip while keeping SDK lock waits bounded.
+  constexpr int MQTT_NETWORK_TIMEOUT_MS = 500;
 
-esp_mqtt_client_handle_t mqttClient = nullptr;
-// MQTT callback is the sole producer; loop is the sole consumer. If the
-// bounded ACK ring overflows we re-register, never infer a missing PUBACK.
-gateway::adapter::MqttAckQueue ackQueue;
-std::atomic<uint32_t> connectionGeneration{0U};
-gateway::adapter::RegistrationAckTracker registrationAck;
-std::atomic<bool> mqttConnected{false};
-std::atomic<uint32_t> mqttAcceptedCount{0U};
-std::atomic<uint32_t> mqttPublishedCount{0U};
-unsigned long lastWifiRetryTime = 0UL;
-unsigned long lastMqttStatusLogTime = 0UL;
-uint32_t lastLoggedAcceptedCount = 0U;
-uint32_t lastLoggedPublishedCount = 0U;
+  esp_mqtt_client_handle_t mqttClient = nullptr;
+  // The MQTT callback produces PUBACKs and the main loop consumes them.
+  // An overflow triggers device registration again.
+  gateway::adapter::MqttAckQueue ackQueue;
+  std::atomic<uint32_t> connectionGeneration{0U};
+  gateway::adapter::RegistrationAckTracker registrationAck;
+  std::atomic<bool> mqttConnected{false};
+  std::atomic<uint32_t> mqttAcceptedCount{0U};
+  std::atomic<uint32_t> mqttPublishedCount{0U};
+  bool wifiHasIp = false;
+  bool mqttStarted = false;
+  uint32_t lastWifiStatusLogTime = 0U;
+  uint32_t lastMqttStartAttemptTime = 0U;
+  uint32_t lastMqttStatusLogTime = 0U;
+  uint32_t lastLoggedAcceptedCount = 0U;
+  uint32_t lastLoggedPublishedCount = 0U;
 
-/** Publish callbacks can run on the MQTT task, so readiness is atomic. */
-void handleMqttEvent(void *, esp_event_base_t, int32_t, void *eventData)
-{
-  const auto event = static_cast<esp_mqtt_event_handle_t>(eventData);
-  if (event == nullptr)
+  /** The SDK callback and main loop share MQTT readiness through atomics. */
+  void handleMqttEvent(void *, esp_event_base_t, int32_t, void *eventData)
   {
-    return;
-  }
-
-  if (event->event_id == MQTT_EVENT_CONNECTED)
-  {
-    ++connectionGeneration;
-    if (!mqttConnected.exchange(true, std::memory_order_acq_rel))
+    const auto event = static_cast<esp_mqtt_event_handle_t>(eventData);
+    if (event == nullptr)
     {
-      Serial.println("Status: MQTT connected to ThingsBoard");
+      return;
     }
-  }
-  else if (event->event_id == MQTT_EVENT_DISCONNECTED)
-  {
-    if (mqttConnected.exchange(false, std::memory_order_acq_rel))
+
+    if (event->event_id == MQTT_EVENT_CONNECTED)
     {
-      Serial.println("Warning: MQTT disconnected; waiting to reconnect");
-    }
-  }
-  else if (event->event_id == MQTT_EVENT_PUBLISHED)
-  {
-    ackQueue.push(connectionGeneration.load(std::memory_order_acquire), event->msg_id);
-    mqttPublishedCount.fetch_add(1U, std::memory_order_relaxed);
-  }
-}
-
-void connectWifi()
-{
-  // SSID and password are configuration secrets; keep them out of serial logs.
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  lastWifiRetryTime = millis();
-}
-
-/** Count the fixed header, remaining-length bytes, topic, id, and payload. */
-bool mqttQos1PacketSize(size_t topicLength,
-                       size_t payloadLength,
-                       size_t *packetLength)
-{
-  if (packetLength == nullptr || topicLength > 0xFFFFU ||
-      payloadLength > SIZE_MAX - topicLength - 6U)
-  {
-    return false;
-  }
-
-  const size_t remainingLength = topicLength + payloadLength + 4U;
-  size_t encodedLengthBytes = 1U;
-  if (remainingLength >= 128U)
-  {
-    encodedLengthBytes = 2U;
-    if (remainingLength >= 16384U)
-    {
-      encodedLengthBytes = 3U;
-      if (remainingLength >= 2097152U)
+      ++connectionGeneration;
+      if (!mqttConnected.exchange(true, std::memory_order_acq_rel))
       {
-        encodedLengthBytes = 4U;
+        Serial.println("Status: MQTT connected to ThingsBoard");
       }
     }
+    else if (event->event_id == MQTT_EVENT_DISCONNECTED)
+    {
+      if (mqttConnected.exchange(false, std::memory_order_acq_rel))
+      {
+        Serial.println("Warning: MQTT disconnected, waiting to reconnect");
+      }
+    }
+    else if (event->event_id == MQTT_EVENT_PUBLISHED)
+    {
+      ackQueue.push(connectionGeneration.load(std::memory_order_acquire), event->msg_id);
+      mqttPublishedCount.fetch_add(1U, std::memory_order_relaxed);
+    }
   }
 
-  *packetLength = 1U + encodedLengthBytes + remainingLength;
-  return true;
-}
+  void updateWifiStatus(uint32_t now)
+  {
+    // Arduino reports WL_CONNECTED after the station receives an IPv4 address.
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      if (!wifiHasIp)
+      {
+        Serial.print("Status: Wi-Fi connected, IP: ");
+        Serial.println(WiFi.localIP());
+      }
+      wifiHasIp = true;
+      return;
+    }
+
+    if (wifiHasIp)
+    {
+      Serial.println("Warning: Wi-Fi disconnected or lost its IP address");
+      lastWifiStatusLogTime = now;
+    }
+    wifiHasIp = false;
+    if (now - lastWifiStatusLogTime >= WIFI_STATUS_LOG_INTERVAL_MS)
+    {
+      Serial.println("Warning: waiting for Wi-Fi IP");
+      lastWifiStatusLogTime = now;
+    }
+  }
+
+  void startMqttWhenReady(uint32_t now)
+  {
+    if (!wifiHasIp || mqttClient == nullptr || mqttStarted ||
+        now - lastMqttStartAttemptTime < MQTT_START_RETRY_INTERVAL_MS)
+    {
+      return;
+    }
+
+    lastMqttStartAttemptTime = now;
+    mqttStarted = esp_mqtt_client_start(mqttClient) == ESP_OK;
+    if (!mqttStarted)
+    {
+      Serial.println("Error: Failed to start MQTT client");
+    }
+  }
+
+  /** Count the fixed header, remaining-length bytes, topic, id, and payload. */
+  bool mqttQos1PacketSize(size_t topicLength,
+                          size_t payloadLength,
+                          size_t *packetLength)
+  {
+    if (packetLength == nullptr || topicLength > 0xFFFFU ||
+        payloadLength > SIZE_MAX - topicLength - 6U)
+    {
+      return false;
+    }
+
+    const size_t remainingLength = topicLength + payloadLength + 4U;
+    size_t encodedLengthBytes = 1U;
+    if (remainingLength >= 128U)
+    {
+      encodedLengthBytes = 2U;
+      if (remainingLength >= 16384U)
+      {
+        encodedLengthBytes = 3U;
+        if (remainingLength >= 2097152U)
+        {
+          encodedLengthBytes = 4U;
+        }
+      }
+    }
+
+    *packetLength = 1U + encodedLengthBytes + remainingLength;
+    return true;
+  }
+  void configureMqttClient()
+  {
+    esp_mqtt_client_config_t mqttConfig = {};
+    mqttConfig.broker.address.hostname = MQTT_HOST;
+    mqttConfig.broker.address.port = MQTT_PORT;
+    mqttConfig.broker.address.transport = MQTT_TRANSPORT_OVER_TCP;
+    mqttConfig.credentials.client_id = MQTT_CLIENT_ID;
+    mqttConfig.credentials.username = MQTT_USERNAME;
+    mqttConfig.credentials.authentication.password = MQTT_PASSWORD;
+    mqttConfig.session.keepalive = 60;
+    mqttConfig.network.reconnect_timeout_ms = MQTT_RECONNECT_INTERVAL_MS;
+    mqttConfig.network.timeout_ms = MQTT_NETWORK_TIMEOUT_MS;
+
+    mqttClient = esp_mqtt_client_init(&mqttConfig);
+    if (mqttClient == nullptr)
+    {
+      Serial.println("Error: Failed to initialize MQTT client");
+      return;
+    }
+
+    if (esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY,
+                                       handleMqttEvent, nullptr) != ESP_OK)
+    {
+      Serial.println("Error: Failed to register MQTT event handler");
+      esp_mqtt_client_destroy(mqttClient);
+      mqttClient = nullptr;
+    }
+  }
+
+  void logMqttTotals(uint32_t now)
+  {
+    if (now - lastMqttStatusLogTime < MQTT_STATUS_LOG_INTERVAL_MS)
+    {
+      return;
+    }
+
+    lastMqttStatusLogTime = now;
+    const uint32_t accepted = mqttAcceptedCount.load(std::memory_order_relaxed);
+    const uint32_t published = mqttPublishedCount.load(std::memory_order_relaxed);
+    if (accepted == lastLoggedAcceptedCount && published == lastLoggedPublishedCount)
+    {
+      return;
+    }
+
+    Serial.print("Status: MQTT handoff totals, enqueued: ");
+    Serial.print(accepted);
+    Serial.print(" | QoS 1 PUBACK: ");
+    Serial.println(published);
+    lastLoggedAcceptedCount = accepted;
+    lastLoggedPublishedCount = published;
+  }
 } // namespace
 
 void initMqtt()
 {
+  const uint32_t now = millis();
+  wifiHasIp = false;
+  mqttStarted = false;
   mqttConnected.store(false, std::memory_order_release);
-  WiFi.mode(WIFI_STA);
+  lastWifiStatusLogTime = now;
+  lastMqttStartAttemptTime = now - MQTT_START_RETRY_INTERVAL_MS;
+
   WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  connectWifi();
-
-  esp_mqtt_client_config_t mqttConfig = {};
-  mqttConfig.broker.address.hostname = MQTT_HOST;
-  mqttConfig.broker.address.port = MQTT_PORT;
-  mqttConfig.broker.address.transport = MQTT_TRANSPORT_OVER_TCP;
-  mqttConfig.credentials.client_id = MQTT_CLIENT_ID;
-  mqttConfig.credentials.username = MQTT_USERNAME;
-  mqttConfig.credentials.authentication.password = MQTT_PASSWORD;
-  mqttConfig.session.keepalive = 60;
-  mqttConfig.network.reconnect_timeout_ms = 5000;
-  mqttConfig.network.timeout_ms = 100;
-
-  mqttClient = esp_mqtt_client_init(&mqttConfig);
-  if (mqttClient == nullptr)
-  {
-    Serial.println("Error: Failed to initialize MQTT client");
-    return;
-  }
-
-  if (esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY,
-                                   handleMqttEvent, nullptr) != ESP_OK)
-  {
-    Serial.println("Error: Failed to register MQTT event handler");
-    esp_mqtt_client_destroy(mqttClient);
-    mqttClient = nullptr;
-    return;
-  }
-
-  if (esp_mqtt_client_start(mqttClient) != ESP_OK)
-  {
-    mqttConnected.store(false, std::memory_order_release);
-    Serial.println("Error: Failed to start MQTT client");
-  }
+  // Configure the station once and let the Wi-Fi driver handle reconnects.
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.println("Status: waiting for Wi-Fi IP");
+  configureMqttClient();
 }
 
 void handleMqtt()
 {
-  const unsigned long now = millis();
-  if (now - lastMqttStatusLogTime >= MQTT_STATUS_LOG_INTERVAL_MS)
-  {
-    const uint32_t accepted =
-        mqttAcceptedCount.load(std::memory_order_relaxed);
-    const uint32_t published =
-        mqttPublishedCount.load(std::memory_order_relaxed);
-    if (accepted != lastLoggedAcceptedCount ||
-        published != lastLoggedPublishedCount)
-    {
-      Serial.print("Status: MQTT handoff totals, enqueued: ");
-      Serial.print(accepted);
-      Serial.print(" | QoS 1 PUBACK: ");
-      Serial.println(published);
-      lastLoggedAcceptedCount = accepted;
-      lastLoggedPublishedCount = published;
-    }
-    lastMqttStatusLogTime = now;
-  }
-
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    return;
-  }
-
-  if (now - lastWifiRetryTime >= WIFI_RETRY_INTERVAL_MS)
-  {
-    connectWifi();
-  }
+  const uint32_t now = millis();
+  updateWifiStatus(now);
+  startMqttWhenReady(now);
+  logMqttTotals(now);
 }
 
 gateway::MqttSession mqttSession()
@@ -188,8 +233,9 @@ gateway::MqttSession mqttSession()
     registrationAck.observe(ack);
   }
   session.registrationLost = ackQueue.takeOverflow();
-  if (session.registrationLost) registrationAck.invalidate();
-  session.connected = mqttConnected.load(std::memory_order_acquire);
+  if (session.registrationLost)
+    registrationAck.invalidate();
+  session.connected = wifiHasIp && mqttConnected.load(std::memory_order_acquire);
   session.generation = connectionGeneration;
   session.registrationAcknowledged = registrationAck.isAcknowledged();
   return session;
@@ -197,8 +243,9 @@ gateway::MqttSession mqttSession()
 
 bool enqueueMqttPayload(const char *topic, const char *payload, size_t payloadLength, uint32_t generation)
 {
-  if (topic == nullptr || generation != connectionGeneration) return false;
-  if (mqttClient == nullptr ||
+  if (topic == nullptr || generation != connectionGeneration)
+    return false;
+  if (mqttClient == nullptr || !wifiHasIp ||
       !mqttConnected.load(std::memory_order_acquire) ||
       payload == nullptr || payloadLength == 0U ||
       payloadLength > static_cast<size_t>(INT_MAX))
