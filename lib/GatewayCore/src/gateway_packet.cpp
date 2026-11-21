@@ -16,6 +16,15 @@ constexpr size_t PAYLOAD_LENGTH_OFFSET = 4U;
 constexpr size_t PAYLOAD_OFFSET = 5U;
 constexpr size_t SEQUENCE_SIZE = 2U;
 
+constexpr size_t TEMPERATURE_OFFSET = 0U;
+constexpr size_t HUMIDITY_OFFSET = 2U;
+constexpr size_t BATTERY_OFFSET = DATA_PAYLOAD_LENGTH;
+constexpr size_t PM25_OFFSET = DATA_BATTERY_PAYLOAD_LENGTH;
+constexpr size_t FORECAST_OFFSET = DATA_PM25_PAYLOAD_LENGTH;
+static_assert(FORECAST_OFFSET + sizeof(uint16_t) * PM25_FORECAST_COUNT ==
+                  DATA_FORECAST_PAYLOAD_LENGTH,
+              "The DATA forecast must contain four 16-bit values");
+
 constexpr uint16_t CRC_INITIAL_VALUE = 0xFFFFU;
 constexpr uint16_t CRC_POLYNOMIAL = 0x1021U;
 constexpr uint16_t CRC_TOP_BIT = 0x8000U;
@@ -37,18 +46,33 @@ bool isKnownErrorCode(uint8_t value)
            value <= static_cast<uint8_t>(PacketErrorCode::PacketBuildFailed);
 }
 
+bool isDataLengthSupported(uint8_t length)
+{
+    return length == DATA_PAYLOAD_LENGTH ||
+           length == DATA_BATTERY_PAYLOAD_LENGTH ||
+           length == DATA_PM25_PAYLOAD_LENGTH ||
+           length == DATA_FORECAST_PAYLOAD_LENGTH;
+}
+
+uint16_t readUint16(const uint8_t *bytes)
+{
+    return static_cast<uint16_t>(bytes[0]) << 8U |
+           static_cast<uint16_t>(bytes[1]);
+}
+
+void writeUint16(uint8_t *bytes, uint16_t value)
+{
+    bytes[0] = static_cast<uint8_t>(value >> 8U);
+    bytes[1] = static_cast<uint8_t>(value);
+}
+
 /**
- * Validate the direction and fixed payload contract associated with each type.
+ * Validate the direction and payload contract associated with each type.
  * This function is shared by encoding and decoding so locally-created packets
  * are held to the same rules as received radio frames.
  */
 bool isMessageValid(const PacketMessage &message)
 {
-    if (message.payloadLength > MAX_PAYLOAD_LENGTH)
-    {
-        return false;
-    }
-
     switch (message.type)
     {
     case PacketType::Poll:
@@ -60,7 +84,7 @@ bool isMessageValid(const PacketMessage &message)
     case PacketType::Data:
         return isNodeAddress(message.source) &&
                message.destination == GATEWAY_ADDRESS &&
-               message.payloadLength == DATA_PAYLOAD_LENGTH;
+               isDataLengthSupported(message.payloadLength);
 
     case PacketType::Ack:
         return message.source == GATEWAY_ADDRESS &&
@@ -106,6 +130,69 @@ uint16_t calculateCrc(const uint8_t *data, size_t length)
 
     return crc;
 }
+
+void writeFrame(const PacketMessage &message, uint8_t *frame)
+{
+    frame[TYPE_OFFSET] = static_cast<uint8_t>(message.type);
+    frame[SOURCE_OFFSET] = message.source;
+    frame[DESTINATION_OFFSET] = message.destination;
+    frame[TRANSACTION_ID_OFFSET] = message.transactionId;
+    frame[PAYLOAD_LENGTH_OFFSET] = message.payloadLength;
+    memcpy(&frame[PAYLOAD_OFFSET], message.payload, message.payloadLength);
+
+    const size_t sequenceOffset = PAYLOAD_OFFSET + message.payloadLength;
+    const size_t crcOffset = sequenceOffset + SEQUENCE_SIZE;
+    writeUint16(&frame[sequenceOffset], message.sequence);
+    writeUint16(&frame[crcOffset], calculateCrc(frame, crcOffset));
+}
+
+PacketMessage readFrame(const uint8_t *input, uint8_t payloadLength)
+{
+    PacketMessage message{};
+    message.type = static_cast<PacketType>(input[TYPE_OFFSET]);
+    message.source = input[SOURCE_OFFSET];
+    message.destination = input[DESTINATION_OFFSET];
+    message.transactionId = input[TRANSACTION_ID_OFFSET];
+    message.payloadLength = payloadLength;
+    memcpy(message.payload, &input[PAYLOAD_OFFSET], payloadLength);
+    message.sequence = readUint16(&input[PAYLOAD_OFFSET + payloadLength]);
+    return message;
+}
+
+int16_t readTemperature(const uint8_t *payload)
+{
+    const uint16_t bits = readUint16(&payload[TEMPERATURE_OFFSET]);
+    int32_t temperature = bits;
+    // Apply the two's-complement wrap before narrowing to int16_t.
+    if ((bits & 0x8000U) != 0U)
+    {
+        temperature -= 0x10000L;
+    }
+    return static_cast<int16_t>(temperature);
+}
+
+OptionalSensorData readOptionalData(const PacketMessage &message)
+{
+    OptionalSensorData data{};
+    // Each supported length extends the previous layout by whole fields.
+    if (message.payloadLength >= DATA_BATTERY_PAYLOAD_LENGTH)
+    {
+        data.batteryMv = readUint16(&message.payload[BATTERY_OFFSET]);
+    }
+    if (message.payloadLength >= DATA_PM25_PAYLOAD_LENGTH)
+    {
+        data.pm25UgM3 = readUint16(&message.payload[PM25_OFFSET]);
+    }
+    if (message.payloadLength == DATA_FORECAST_PAYLOAD_LENGTH)
+    {
+        for (size_t step = 0U; step < PM25_FORECAST_COUNT; ++step)
+        {
+            const size_t offset = FORECAST_OFFSET + step * sizeof(uint16_t);
+            data.pm25Forecast[step] = readUint16(&message.payload[offset]);
+        }
+    }
+    return data;
+}
 } // namespace
 
 bool encodePacket(const PacketMessage *message,
@@ -113,14 +200,8 @@ bool encodePacket(const PacketMessage *message,
                   size_t outputCapacity,
                   size_t *outputLength)
 {
-    // Validate pointers before dereferencing them. Requiring all three outputs
-    // up front gives the function a simple all-or-nothing result contract.
-    if (message == nullptr || output == nullptr || outputLength == nullptr)
-    {
-        return false;
-    }
-
-    if (!isMessageValid(*message))
+    if (message == nullptr || output == nullptr || outputLength == nullptr ||
+        !isMessageValid(*message))
     {
         return false;
     }
@@ -131,32 +212,9 @@ bool encodePacket(const PacketMessage *message,
         return false;
     }
 
-    // The temporary frame preserves the caller's output when any validation or
-    // size check fails. Its fixed 64-byte storage is suitable for the ESP32 stack.
+    // Build privately before copying a complete frame to the caller.
     uint8_t frame[MAX_FRAME_LENGTH] = {};
-    frame[TYPE_OFFSET] = static_cast<uint8_t>(message->type);
-    frame[SOURCE_OFFSET] = message->source;
-    frame[DESTINATION_OFFSET] = message->destination;
-    frame[TRANSACTION_ID_OFFSET] = message->transactionId;
-    frame[PAYLOAD_LENGTH_OFFSET] = message->payloadLength;
-
-    if (message->payloadLength > 0U)
-    {
-        memcpy(&frame[PAYLOAD_OFFSET],
-               message->payload,
-               message->payloadLength);
-    }
-
-    const size_t sequenceOffset = PAYLOAD_OFFSET + message->payloadLength;
-    frame[sequenceOffset] = static_cast<uint8_t>(message->sequence >> 8U);
-    frame[sequenceOffset + 1U] = static_cast<uint8_t>(message->sequence);
-
-    const size_t crcOffset = sequenceOffset + SEQUENCE_SIZE;
-    const uint16_t crc = calculateCrc(frame, crcOffset);
-    frame[crcOffset] = static_cast<uint8_t>(crc >> 8U);
-    frame[crcOffset + 1U] = static_cast<uint8_t>(crc);
-
-    // Commit both outputs only after the complete frame has been constructed.
+    writeFrame(*message, frame);
     memcpy(output, frame, frameLength);
     *outputLength = frameLength;
     return true;
@@ -166,14 +224,10 @@ bool decodePacket(const uint8_t *input,
                   size_t inputLength,
                   PacketMessage *message)
 {
-    if (input == nullptr || message == nullptr)
-    {
-        return false;
-    }
-
     // The length guard makes every later access to the five-byte header, the
     // sequence, and the CRC safe.
-    if (inputLength < MIN_FRAME_LENGTH || inputLength > MAX_FRAME_LENGTH)
+    if (input == nullptr || message == nullptr ||
+        inputLength < MIN_FRAME_LENGTH || inputLength > MAX_FRAME_LENGTH)
     {
         return false;
     }
@@ -185,34 +239,15 @@ bool decodePacket(const uint8_t *input,
         return false;
     }
 
-    const size_t sequenceOffset = PAYLOAD_OFFSET + payloadLength;
-    const size_t crcOffset = sequenceOffset + SEQUENCE_SIZE;
-    const uint16_t receivedCrc =
-        static_cast<uint16_t>(input[crcOffset]) << 8U |
-        static_cast<uint16_t>(input[crcOffset + 1U]);
+    const size_t crcOffset = PAYLOAD_OFFSET + payloadLength + SEQUENCE_SIZE;
 
     // CRC is checked before the received bytes can influence application state.
-    if (receivedCrc != calculateCrc(input, crcOffset))
+    if (readUint16(&input[crcOffset]) != calculateCrc(input, crcOffset))
     {
         return false;
     }
 
-    PacketMessage decoded{};
-    decoded.type = static_cast<PacketType>(input[TYPE_OFFSET]);
-    decoded.source = input[SOURCE_OFFSET];
-    decoded.destination = input[DESTINATION_OFFSET];
-    decoded.transactionId = input[TRANSACTION_ID_OFFSET];
-    decoded.payloadLength = payloadLength;
-
-    if (payloadLength > 0U)
-    {
-        memcpy(decoded.payload, &input[PAYLOAD_OFFSET], payloadLength);
-    }
-
-    decoded.sequence =
-        static_cast<uint16_t>(input[sequenceOffset]) << 8U |
-        static_cast<uint16_t>(input[sequenceOffset + 1U]);
-
+    const PacketMessage decoded = readFrame(input, payloadLength);
     if (!isMessageValid(decoded))
     {
         return false;
@@ -227,34 +262,29 @@ bool decodeDataPayload(const PacketMessage *message,
                        int16_t *temperatureX10,
                        uint16_t *humidityX10)
 {
-    if (message == nullptr || temperatureX10 == nullptr || humidityX10 == nullptr)
+    SensorData data{};
+    if (temperatureX10 == nullptr || humidityX10 == nullptr ||
+        !decodeDataPayload(message, &data))
     {
         return false;
     }
 
-    if (message->type != PacketType::Data ||
-        message->payloadLength != DATA_PAYLOAD_LENGTH)
+    *temperatureX10 = data.temperatureX10;
+    *humidityX10 = data.humidityX10;
+    return true;
+}
+
+bool decodeDataPayload(const PacketMessage *message, SensorData *data)
+{
+    if (message == nullptr || data == nullptr || message->type != PacketType::Data ||
+        !isDataLengthSupported(message->payloadLength))
     {
         return false;
     }
 
-    const uint16_t temperatureBits =
-        static_cast<uint16_t>(message->payload[0]) << 8U |
-        static_cast<uint16_t>(message->payload[1]);
-    const uint16_t decodedHumidity =
-        static_cast<uint16_t>(message->payload[2]) << 8U |
-        static_cast<uint16_t>(message->payload[3]);
-
-    // Convert two's-complement explicitly instead of relying on the
-    // implementation-defined uint16_t-to-int16_t conversion above INT16_MAX.
-    int32_t decodedTemperature = temperatureBits;
-    if ((temperatureBits & 0x8000U) != 0U)
-    {
-        decodedTemperature -= 0x10000L;
-    }
-
-    *temperatureX10 = static_cast<int16_t>(decodedTemperature);
-    *humidityX10 = decodedHumidity;
+    data->temperatureX10 = readTemperature(message->payload);
+    data->humidityX10 = readUint16(&message->payload[HUMIDITY_OFFSET]);
+    data->optional = readOptionalData(*message);
     return true;
 }
 

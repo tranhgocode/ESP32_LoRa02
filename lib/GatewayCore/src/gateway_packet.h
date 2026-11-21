@@ -1,5 +1,7 @@
 #pragma once
 
+#include "sensor_data.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -16,6 +18,9 @@ constexpr size_t MIN_FRAME_LENGTH = 9U;
 constexpr size_t MAX_FRAME_LENGTH = 64U;
 constexpr size_t MAX_PAYLOAD_LENGTH = 55U;
 constexpr uint8_t DATA_PAYLOAD_LENGTH = 4U;
+constexpr uint8_t DATA_BATTERY_PAYLOAD_LENGTH = 6U;
+constexpr uint8_t DATA_PM25_PAYLOAD_LENGTH = 8U;
+constexpr uint8_t DATA_FORECAST_PAYLOAD_LENGTH = 16U;
 constexpr uint8_t ERROR_PAYLOAD_LENGTH = 1U;
 
 /** Packet types supported by both the ESP32 gateway and the SAMD21 sensor. */
@@ -41,7 +46,7 @@ enum class PacketErrorCode : uint8_t
  *
  * The struct itself is never sent over radio because compiler padding and CPU
  * byte order are not a wire format. encodePacket() serializes every field
- * explicitly; decodePacket() performs the reverse operation after validating
+ * explicitly. decodePacket() performs the reverse operation after validating
  * the complete frame.
  */
 struct PacketMessage
@@ -83,15 +88,15 @@ bool decodePacket(const uint8_t *input,
                   PacketMessage *message);
 
 /**
- * Read the fixed-point values from an already-decoded DATA packet.
- *
- * Temperature is a signed two's-complement int16 multiplied by 10; humidity is
- * an unsigned uint16 multiplied by 10. Both fields are big-endian. This helper
- * checks type and payload length and leaves both outputs unchanged on failure.
+ * Read the fixed-point values from any supported DATA packet.
+ * Outputs stay unchanged if the packet cannot be decoded.
  */
 bool decodeDataPayload(const PacketMessage *message,
                        int16_t *temperatureX10,
                        uint16_t *humidityX10);
+
+/** Decode all present DATA fields and mark fields missing from shorter packets. */
+bool decodeDataPayload(const PacketMessage *message, SensorData *data);
 
 /**
  * Read and validate the single error code from an already-decoded ERROR packet.
