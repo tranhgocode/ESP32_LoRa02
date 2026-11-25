@@ -8,8 +8,6 @@ namespace gateway
 {
 namespace
 {
-constexpr uint16_t FORECAST_SEQUENCE_INTERVAL = 24U;
-
 /** Keep partial JSON private until the entire payload fits the output buffer. */
 template <size_t Capacity>
 class JsonBuffer
@@ -52,28 +50,25 @@ unsigned long magnitude(int32_t value)
     return static_cast<unsigned long>(value < 0 ? -value : value);
 }
 
-bool appendBaseTelemetry(TelemetryJson &json, const TelemetrySample &sample)
+bool appendTemperatureAndHumidity(TelemetryJson &json, const TelemetrySample &sample)
 {
     const unsigned long temperature = magnitude(sample.temperatureX10);
     const unsigned long humidity = sample.humidityX10;
-    const unsigned long snr = magnitude(sample.snrX4);
 
     // Keep fixed-point values exact without floating-point formatting.
-    return json.append(
-        "{\"node_id\":%u,\"sequence\":%u,"
-        "\"temperature\":%s%lu.%lu,\"humidity\":%lu.%lu,"
-        "\"rssi\":%d,\"snr\":%s%lu.%02lu",
-        static_cast<unsigned int>(sample.nodeId),
-        static_cast<unsigned int>(sample.sequence),
-        sample.temperatureX10 < 0 ? "-" : "",
-        temperature / 10UL,
-        temperature % 10UL,
-        humidity / 10UL,
-        humidity % 10UL,
-        static_cast<int>(sample.rssi),
-        sample.snrX4 < 0 ? "-" : "",
-        snr / 4UL,
-        (snr % 4UL) * 25UL);
+    return json.append(",\"temperature\":%s%lu.%lu,\"humidity\":%lu.%lu",
+                       sample.temperatureX10 < 0 ? "-" : "",
+                       temperature / 10UL, temperature % 10UL,
+                       humidity / 10UL, humidity % 10UL);
+}
+
+bool appendRadioSignal(TelemetryJson &json, const TelemetrySample &sample)
+{
+    const unsigned long snr = magnitude(sample.snrX4);
+    return json.append(",\"rssi\":%d,\"snr\":%s%lu.%02lu",
+                       static_cast<int>(sample.rssi),
+                       sample.snrX4 < 0 ? "-" : "",
+                       snr / 4UL, (snr % 4UL) * 25UL);
 }
 
 bool appendBatteryLevel(TelemetryJson &json, uint16_t millivolts, const BatteryCurve &curve)
@@ -83,28 +78,25 @@ bool appendBatteryLevel(TelemetryJson &json, uint16_t millivolts, const BatteryC
            json.append(",\"batteryLevel\":%u", static_cast<unsigned int>(percent));
 }
 
-bool appendForecast(TelemetryJson &json, const TelemetrySample &sample)
+bool hasCompleteForecast(const OptionalSensorData &data)
 {
-    // Sequence starts at zero, so the first 24-slot window ends at Seq 23.
-    if (sample.sequence % FORECAST_SEQUENCE_INTERVAL != FORECAST_SEQUENCE_INTERVAL - 1U)
-    {
-        return true;
-    }
-
-    // Publish a forecast only when all four values came from this report.
-    const auto &forecast = sample.optional.pm25Forecast;
-    for (uint16_t value : forecast)
+    for (uint16_t value : data.pm25Forecast)
     {
         if (value == SENSOR_VALUE_UNAVAILABLE)
         {
-            return true;
+            return false;
         }
     }
+    return true;
+}
+
+bool appendForecastSteps(TelemetryJson &json, const OptionalSensorData &data)
+{
     for (size_t step = 0U; step < PM25_FORECAST_COUNT; ++step)
     {
         if (!json.append(",\"pm25_forecast_step_%u\":%u",
                          static_cast<unsigned int>(step + 1U),
-                         static_cast<unsigned int>(forecast[step])))
+                         static_cast<unsigned int>(data.pm25Forecast[step])))
         {
             return false;
         }
@@ -115,11 +107,15 @@ bool appendForecast(TelemetryJson &json, const TelemetrySample &sample)
 bool appendTelemetry(TelemetryJson &json, const TelemetrySample &sample, const BatteryCurve &curve)
 {
     const OptionalSensorData &data = sample.optional;
-    return appendBaseTelemetry(json, sample) &&
+    return json.append("{\"node_id\":%u,\"sequence\":%u",
+                       static_cast<unsigned int>(sample.nodeId),
+                       static_cast<unsigned int>(sample.sequence)) &&
+           appendTemperatureAndHumidity(json, sample) &&
+           appendRadioSignal(json, sample) &&
            appendBatteryLevel(json, data.batteryMv, curve) &&
            (data.pm25UgM3 == SENSOR_VALUE_UNAVAILABLE ||
             json.append(",\"pm25\":%u", static_cast<unsigned int>(data.pm25UgM3))) &&
-           appendForecast(json, sample) &&
+           (!hasCompleteForecast(data) || appendForecastSteps(json, data)) &&
            json.append("}");
 }
 } // namespace

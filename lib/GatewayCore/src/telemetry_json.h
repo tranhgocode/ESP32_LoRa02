@@ -13,8 +13,8 @@ constexpr size_t TELEMETRY_JSON_CAPACITY = 320U;
 /**
  * Serialize one telemetry sample to the gateway MQTT JSON schema.
  *
- * Includes the base fields and available PM2.5. Complete forecasts appear at
- * sequence numbers 23, 47, 71, and every 24 sequences thereafter.
+ * Includes the base fields, available PM2.5, and all four forecast values
+ * when the sample contains a complete forecast.
  * Temperature and humidity have one decimal digit and SNR has two.
  *
  * Output and length stay unchanged on failure. On success the output is
